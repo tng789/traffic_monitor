@@ -163,7 +163,7 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
             continue
         
         timestamp = recognize_timestamp_easyocr(frame, config['timestamp'][0], config['timestamp'][1])
-        
+
         red_light = is_red_light_on(frame, config['light'])
 
         # 4. 对当前帧进行跟踪
@@ -219,8 +219,8 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
 
     # 保存原始文本格式到Redis，用于兼容性（可选）
     # 将lines作为一个整体字符串保存到Redis
-    full_text = ''.join(lines)
-    r.set(f'{video_path}:text', full_text)
+    # full_text = ''.join(lines)
+    # r.set(f'{video_path}:text', full_text)
     
     print(f"\n跟踪完成！结果已保存到Redis的 '{video_path}' 键中")
     print(f"总共保存了 {len(lines)} 条检测记录")

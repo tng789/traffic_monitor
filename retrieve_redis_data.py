@@ -5,6 +5,9 @@ import threading
 from collections import defaultdict
 from typing import List, Tuple
 import sqlite3
+import jason
+
+from pathlibimport Path
 
 class RedisDataRetriever:
     def __init__(self, video_name, redis_host='localhost', redis_port=6379, redis_db=0, db_path='violations.db'):
@@ -54,6 +57,13 @@ class RedisDataRetriever:
         conn.commit()
         conn.close()
 
+    def read_confs(self):
+        """
+        读取配置文件
+        """
+        with open(self.video_name) as f:
+            conf = json.load(f)
+        pass
     def insert_violation_record(self, frame_id, timestamp, traffic_volume, track_id, x1, y1, x2, y2, red_light_status, violation):
         """
         插入违规记录到数据库的指定表
