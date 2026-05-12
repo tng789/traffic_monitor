@@ -6,7 +6,7 @@ import json
 from tell_time import recognize_timestamp_easyocr
 
 
-def is_red_light_on(img, x1, y1, x2, y2):
+def is_red_light_on(img, position):
     """
     判断交通灯中的红灯是否亮起
     
@@ -19,6 +19,7 @@ def is_red_light_on(img, x1, y1, x2, y2):
         bool: True表示红灯亮，False表示红灯未亮
     """
     # 提取感兴趣区域
+    x1, y1, x2, y2 = position
     roi = img[int(y1):int(y2), int(x1):int(x2)]
     
     # 转换为HSV色彩空间，便于颜色检测
@@ -104,7 +105,7 @@ def is_red_light_on_by_brightness(img, x1, y1, x2, y2, brightness_threshold=100)
     return red_ratio > 0.1
 
 
-def track_video_and_save(video_path, output_txt_path, model_path="best.pt", device='cpu', redis_host='localhost', redis_port=6379, redis_db=0):
+def track_video(video_path,  model, config,  device='cpu', redis_host='localhost', redis_port=6379, redis_db=0):
     """
     使用YOLO模型对视频进行目标跟踪，并将结果保存到Redis。
 
@@ -117,12 +118,12 @@ def track_video_and_save(video_path, output_txt_path, model_path="best.pt", devi
         redis_port (int): Redis服务器端口
         redis_db (int): Redis数据库编号
     """
-    # 1. 加载YOLO模型
-    print(f"正在加载模型: {model_path}")
-    model = YOLO(model_path)
-    model.to(device)  # 将模型移动到指定设备
-    
-    print(f"模型将运行在: {device}")
+#    # 1. 加载YOLO模型
+#    print(f"正在加载模型: {model_path}")
+#    model = YOLO(model_path)
+#    model.to(device)  # 将模型移动到指定设备
+#    
+#    print(f"模型将运行在: {device}")
 
     # 连接到Redis
     try:
@@ -161,8 +162,9 @@ def track_video_and_save(video_path, output_txt_path, model_path="best.pt", devi
         if frame_num % 10 != 0:
             continue
         
-        timestamp = recognize_timestamp_easyocr(frame)
-        red_light = is_red_light_on(frame, 20,30, 50,80)
+        timestamp = recognize_timestamp_easyocr(frame, config['timestamp'][0], config['timestamp'][1])
+        
+        red_light = is_red_light_on(frame, config['light'])
 
         # 4. 对当前帧进行跟踪
         # persist=True 确保目标ID在帧间保持一致
@@ -218,9 +220,9 @@ def track_video_and_save(video_path, output_txt_path, model_path="best.pt", devi
     # 保存原始文本格式到Redis，用于兼容性（可选）
     # 将lines作为一个整体字符串保存到Redis
     full_text = ''.join(lines)
-    r.set('video:text', full_text)
+    r.set(f'{video_path}:text', full_text)
     
-    print(f"\n跟踪完成！结果已保存到Redis的 'video' 键中")
+    print(f"\n跟踪完成！结果已保存到Redis的 '{video_path}' 键中")
     print(f"总共保存了 {len(lines)} 条检测记录")
 
 # --- 主程序 ---
@@ -229,8 +231,13 @@ if __name__ == "__main__":
     input_video = sys.argv[1]           #"your_video.mp4"  # 替换为你的视频文件路径
     output_file = "results.txt"     # 替换为你想要的输出文件名
     
+    with open(input_video, 'rt') as f:
+        confs = json.load(f)
+
+    print("正在装入检测模型")
     # 可以通过第三个参数指定设备，例如使用GPU: device='cuda'
     device = 'cuda' if len(sys.argv) < 3 else sys.argv[2]  # 默认使用GPU，如果提供了命令行参数则使用该参数指定的设备
+    model = YOLO('best.pt')
     
     # 运行跟踪函数
-    track_video_and_save(input_video, output_file, device=device)
+    track_video(input_video, model, config = confs,  device=device)

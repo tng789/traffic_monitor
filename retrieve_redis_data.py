@@ -7,10 +7,13 @@ from typing import List, Tuple
 import sqlite3
 
 class RedisDataRetriever:
-    def __init__(self, redis_host='localhost', redis_port=6379, redis_db=0, db_path='violations.db'):
+    def __init__(self, video_name, redis_host='localhost', redis_port=6379, redis_db=0, db_path='violations.db'):
         """
         初始化Redis连接和SQLite数据库
         """
+        self.video_name = video_name
+        self.table_name = f"video_{video_name.replace('-', '_').replace('.', '_')}"  # 表名规范化
+        
         try:
             self.r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
             # 测试连接
@@ -25,14 +28,14 @@ class RedisDataRetriever:
 
     def init_database(self):
         """
-        初始化SQLite数据库，创建违规记录表
+        初始化SQLite数据库，为当前视频流创建违规记录表
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # 创建违规记录表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS video (
+        # 创建针对此视频流的违规记录表
+        create_table_sql = f'''
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 frame_id INTEGER,
                 timestamp TEXT,
@@ -45,24 +48,26 @@ class RedisDataRetriever:
                 red_light_status BOOLEAN,
                 violation TEXT
             )
-        ''')
+        '''
+        cursor.execute(create_table_sql)
         
         conn.commit()
         conn.close()
 
     def insert_violation_record(self, frame_id, timestamp, traffic_volume, track_id, x1, y1, x2, y2, red_light_status, violation):
         """
-        插入违规记录到数据库
+        插入违规记录到数据库的指定表
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO video (
+        insert_sql = f'''
+            INSERT INTO {self.table_name} (
                 frame_id, timestamp, traffic_volume, track_id, 
                 x1, y1, x2, y2, red_light_status, violation
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (frame_id, timestamp, traffic_volume, track_id, x1, y1, x2, y2, red_light_status, violation))
+        '''
+        cursor.execute(insert_sql, (frame_id, timestamp, traffic_volume, track_id, x1, y1, x2, y2, red_light_status, violation))
         
         conn.commit()
         conn.close()
@@ -254,7 +259,7 @@ class RedisDataRetriever:
                 time.sleep(2)  # 等待2秒再检查
                 continue
             
-            print(f"处理帧间隔: 当前帧 {current_max_frame}")
+            print(f"[{self.video_name}] 处理帧间隔: 当前帧 {current_max_frame}")
             
             # 按track_id分组
             track_groups = self.group_by_track_id(all_detections)
@@ -265,19 +270,19 @@ class RedisDataRetriever:
             # 遍历每个track，根据规则判断是否处理
             for track_id, detections in track_groups.items():
                 if self.should_process_track(detections, current_max_frame, frame_threshold, duration_threshold):
-                    print(f"处理Track ID {track_id}: 共 {len(detections)} 个检测点")
+                    print(f"[{self.video_name}] 处理Track ID {track_id}: 共 {len(detections)} 个检测点")
                     to_process.extend(detections)
             
             # 从Redis中删除已处理的数据
             if to_process:
-                print(f"找到 {len(to_process)} 个需要处理的检测数据，从Redis中删除...")
+                print(f"[{self.video_name}] 找到 {len(to_process)} 个需要处理的检测数据，从Redis中删除...")
                 self.remove_processed_data_from_redis(to_process)
                 
                 # 这里可以根据需要进一步处理数据
                 # 例如保存到文件，发送到其他服务等
                 self.handle_processed_data(to_process)
             else:
-                print("没有需要处理的数据")
+                print(f"[{self.video_name}] 没有需要处理的数据")
             
             # 等待一段时间后再进行下次检查, 这时间待定
             time.sleep(2)
@@ -292,12 +297,12 @@ class RedisDataRetriever:
         # 获取当前批次的最大track_id，对应traffic_volume字段
         max_track_id = max(track_groups.keys()) if track_groups else 0
         
-        print(f"处理 {len(track_groups)} 个不同的track，共 {len(detections)} 个检测点:")
+        print(f"[{self.video_name}] 处理 {len(track_groups)} 个不同的track，共 {len(detections)} 个检测点:")
         for track_id, track_detections in track_groups.items():
             min_frame = min(d['frame_id'] for d in track_detections)
             max_frame = max(d['frame_id'] for d in track_detections)
             duration = max_frame - min_frame
-            print(f"  Track {track_id}: 帧范围 {min_frame}-{max_frame}, 持续 {duration} 帧")
+            print(f"  [{self.video_name}] Track {track_id}: 帧范围 {min_frame}-{max_frame}, 持续 {duration} 帧")
             
             # 获取轨迹的起始坐标点
             first_detection = track_detections[0]
@@ -328,7 +333,7 @@ class RedisDataRetriever:
             is_retrograde = self.detect_retrograde(track_detections, region_vertices, normal_direction)
             
             if is_retrograde:
-                print(f"  Track {track_id}: 逆行")
+                print(f"  [{self.video_name}] Track {track_id}: 逆行")
                 # 插入数据库记录
                 self.insert_violation_record(
                     frame_id=min_frame,
@@ -343,7 +348,7 @@ class RedisDataRetriever:
                     violation='逆行'
                 )
             else:
-                print(f"  Track {track_id}: 正常行驶")
+                print(f"  [{self.video_name}] Track {track_id}: 正常行驶")
 
             # 添加判断闯红灯功能
             # 方法：事先设闯红灯定判断区域, 由多个坐标作为顶点组成的凸多边形。 
@@ -372,7 +377,7 @@ class RedisDataRetriever:
                         
             # 如果在红灯期间至少出现了3次在违规区域内，则判断为闯红灯
             if violations_count >= 3:
-                print(f"  Track {track_id}: 闯红灯")
+                print(f"  [{self.video_name}] Track {track_id}: 闯红灯")
                 # 插入数据库记录
                 self.insert_violation_record(
                     frame_id=min_frame,
@@ -387,12 +392,12 @@ class RedisDataRetriever:
                     violation='闯红灯'
                 )
             else:
-                print(f"  Track {track_id}: 正常行驶")
+                print(f"  [{self.video_name}] Track {track_id}: 正常行驶")
 
             # 判断不戴头盔
             is_helmet_violation = self.detect_helmet_violation(track_detections)
             if is_helmet_violation:
-                print(f"  Track {track_id}: 不戴头盔")
+                print(f"  [{self.video_name}] Track {track_id}: 不戴头盔")
                 # 插入数据库记录
                 self.insert_violation_record(
                     frame_id=min_frame,
@@ -407,12 +412,12 @@ class RedisDataRetriever:
                     violation='不戴头盔'
                 )
             else:
-                print(f"  Track {track_id}: 正常行驶")
+                print(f"  [{self.video_name}] Track {track_id}: 正常行驶")
 
             # 判断骑车带人
             is_carrying_violation = self.detect_carrying_violation(track_detections)
             if is_carrying_violation:
-                print(f"  Track {track_id}: 骑车带人")
+                print(f"  [{self.video_name}] Track {track_id}: 骑车带人")
                 # 插入数据库记录
                 self.insert_violation_record(
                     frame_id=min_frame,
@@ -427,16 +432,23 @@ class RedisDataRetriever:
                     violation='骑车带人'
                 )
             else:
-                print(f"  Track {track_id}: 正常行驶")
+                print(f"  [{self.video_name}] Track {track_id}: 正常行驶")
 
 
 def main():
     """
     主函数，启动Redis数据处理
     """
-    retriever = RedisDataRetriever()
+    # 假设我们有一个视频名称，实际使用时应该通过参数传入
+    import sys
+    if len(sys.argv) < 2:
+        print("请提供视频名称作为参数")
+        return
     
-    print("开始监控Redis数据...")
+    video_name = sys.argv[1]
+    retriever = RedisDataRetriever(video_name)
+    
+    print(f"[{video_name}] 开始监控Redis数据...")
     print("处理规则:")
     print("1. 每隔750帧处理一次数据")
     print("2. 如果track在M-60到M帧内未出现，则视为结束，提取其数据")
