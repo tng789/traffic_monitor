@@ -1,10 +1,13 @@
 from ultralytics import YOLO
 import cv2
+import numpy as np
 import sys
 import redis
 import json
-from tell_time import recognize_timestamp_easyocr
-
+from tell_time import recognize_timestamp_cv2,recognize_timestamp_easyocr
+from pathlib import Path
+import time
+import easyocr
 
 def is_red_light_on(img, position):
     """
@@ -27,12 +30,12 @@ def is_red_light_on(img, position):
     
     # 定义红色范围（HSV空间）
     # 注意：红色在HSV中有两个范围，因为HSV是一个圆柱坐标系
-    lower_red1 = cv2.np.array([0, 50, 50])
-    upper_red1 = cv2.np.array([10, 255, 255])
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
     mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
     
-    lower_red2 = cv2.np.array([170, 50, 50])
-    upper_red2 = cv2.np.array([180, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
     mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
     
     # 合并两个掩码
@@ -52,7 +55,7 @@ def is_red_light_on(img, position):
     return red_ratio > 0.1
 
 
-def is_red_light_on_by_brightness(img, x1, y1, x2, y2, brightness_threshold=100):
+def is_red_light_on_by_brightness(img, position, brightness_threshold=100):
     """
     通过亮度判断交通灯中的红灯是否亮起
     此方法首先检测交通灯区域的整体亮度，然后在高亮区域中查找红色像素
@@ -67,6 +70,8 @@ def is_red_light_on_by_brightness(img, x1, y1, x2, y2, brightness_threshold=100)
         bool: True表示红灯亮，False表示红灯未亮
     """
     # 提取感兴趣区域
+    x1, y1, x2, y2 = position
+    roi = img[int(y1):int(y2), int(x1):int(x2)]
     roi = img[int(y1):int(y2), int(x1):int(x2)]
     
     # 转换为灰度图以测量亮度
@@ -83,12 +88,12 @@ def is_red_light_on_by_brightness(img, x1, y1, x2, y2, brightness_threshold=100)
     hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
     # 定义红色范围（HSV空间）
-    lower_red1 = cv2.np.array([0, 50, 50])
-    upper_red1 = cv2.np.array([10, 255, 255])
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
     mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
     
-    lower_red2 = cv2.np.array([170, 50, 50])
-    upper_red2 = cv2.np.array([180, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
     mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
     
     # 合并两个掩码
@@ -105,7 +110,7 @@ def is_red_light_on_by_brightness(img, x1, y1, x2, y2, brightness_threshold=100)
     return red_ratio > 0.1
 
 
-def track_video(video_path,  model, config,  device='cpu', redis_host='localhost', redis_port=6379, redis_db=0):
+def track_video(video_path,  model, config,  device='cuda', redis_host='localhost', redis_port=6379, redis_db=0):
     """
     使用YOLO模型对视频进行目标跟踪，并将结果保存到Redis。
 
@@ -118,12 +123,6 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
         redis_port (int): Redis服务器端口
         redis_db (int): Redis数据库编号
     """
-#    # 1. 加载YOLO模型
-#    print(f"正在加载模型: {model_path}")
-#    model = YOLO(model_path)
-#    model.to(device)  # 将模型移动到指定设备
-#    
-#    print(f"模型将运行在: {device}")
 
     # 连接到Redis
     try:
@@ -135,6 +134,9 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
         print(f"错误: 无法连接到Redis服务器: {e}")
         return
 
+    reader = easyocr.Reader(['en'], gpu=True,
+                               model_storage_directory="./models",
+                               download_enabled=False)  # 禁止下载，使用本地模
     # 2. 打开视频文件
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -149,7 +151,6 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
     # 清空之前可能存在的video相关的数据
     r.delete('video')
     
-    lines = []
     frame_num = 0
     print("开始处理视频...")
     
@@ -159,12 +160,15 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
             break
         
         frame_num += 1
-        if frame_num % 10 != 0:
+        if frame_num % 15 != 0:
             continue
-        
-        timestamp = recognize_timestamp_easyocr(frame, config['timestamp'][0], config['timestamp'][1])
 
-        red_light = is_red_light_on(frame, config['light'])
+        print(f"已处理 {frame_num} 帧")
+        
+        timestamp = recognize_timestamp_easyocr(frame, reader, config['timestamp'][0], config['timestamp'][1])
+
+        red_light = is_red_light_on_by_brightness(frame, config['light'])
+
 
         # 4. 对当前帧进行跟踪
         # persist=True 确保目标ID在帧间保持一致
@@ -207,7 +211,7 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
                     
                     # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
                     line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
-                    lines.append(line)
+                    print(line)
 
             
             # 可选：在控制台打印进度
@@ -222,8 +226,6 @@ def track_video(video_path,  model, config,  device='cpu', redis_host='localhost
     # full_text = ''.join(lines)
     # r.set(f'{video_path}:text', full_text)
     
-    print(f"\n跟踪完成！结果已保存到Redis的 '{video_path}' 键中")
-    print(f"总共保存了 {len(lines)} 条检测记录")
 
 # --- 主程序 ---
 if __name__ == "__main__":
@@ -231,7 +233,8 @@ if __name__ == "__main__":
     input_video = sys.argv[1]           #"your_video.mp4"  # 替换为你的视频文件路径
     output_file = "results.txt"     # 替换为你想要的输出文件名
     
-    with open(input_video, 'rt') as f:
+    conf_file = Path(input_video).stem + ".json"
+    with open(conf_file, 'rt') as f:
         confs = json.load(f)
 
     print("正在装入检测模型")

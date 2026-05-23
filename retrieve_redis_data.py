@@ -5,9 +5,9 @@ import threading
 from collections import defaultdict
 from typing import List, Tuple
 import sqlite3
-import jason
+import json
 
-from pathlibimport Path
+from pathlib import Path
 
 class RedisDataRetriever:
     def __init__(self, video_name, redis_host='localhost', redis_port=6379, redis_db=0, db_path='violations.db'):
@@ -263,6 +263,10 @@ class RedisDataRetriever:
                 
             current_max_frame = max(detection['frame_id'] for detection in all_detections)
             
+            # print(f"[{self.video_name}] 当前最大帧号: {current_max_frame}")
+            # continue
+
+
             # 检查是否达到了处理间隔
             if current_max_frame % frame_interval != 0:
                 print(f"当前帧 {current_max_frame} 未达到处理间隔 {frame_interval}，等待...")
