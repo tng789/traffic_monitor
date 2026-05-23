@@ -142,7 +142,7 @@ def track_video(camera, stop_event=None, device='cuda'):
         stop_event (threading.Event): Event to signal the function to stop
         device (str): 设备类型 ('cpu', 'cuda', 'cuda:0', 'cuda:1'等)
     """
-    cfg_file = f'config/{camera}.json'
+    cfg_file = f'{camera}.json'
     try:
         with open(cfg_file) as f:
             config = json.load(f)
@@ -279,7 +279,7 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
     # Process the command
     if command == "start":
         print(f"Starting processing for camera {camera}")
-        
+
         # Check if the camera is already being processed
         if camera in active_processes:
             if active_processes[camera]['running']:
