@@ -16,6 +16,7 @@ import threading
 yolo_model = None
 easyocr_reader = None
 configurations = {}
+active_processes = {}  # Dictionary to keep track of active video tracking processes
 
 def is_red_light_on(img, position):
     """
@@ -132,20 +133,15 @@ def load_models():
     print("模型装载完成！")
 
 
-def track_video(camera, command,  device='cuda'):
+def track_video(camera, stop_event=None, device='cuda'):
     """
     使用YOLO模型对视频进行目标跟踪，并将结果保存到Redis。
 
     Args:
-        video_path (str): 输入视频文件的路径。
-        output_txt_path (str): 输出结果文本文件的路径（保留用于兼容性）。
-        model_path (str): YOLO模型路径，默认为'best.pt'。
+        camera (str): Camera identifier string
+        stop_event (threading.Event): Event to signal the function to stop
         device (str): 设备类型 ('cpu', 'cuda', 'cuda:0', 'cuda:1'等)
-        redis_host (str): Redis服务器主机地址
-        redis_port (int): Redis服务器端口
-        redis_db (int): Redis数据库编号
     """
-
     cfg_file = f'config/{camera}.json'
     try:
         with open(cfg_file) as f:
@@ -167,21 +163,27 @@ def track_video(camera, command,  device='cuda'):
 
     global yolo_model, redis_connection
     # 清空之前可能存在的video相关的数据
-    redis_connection.delete('video')
+    redis_connection.delete(f'video:{camera}')
     
     frame_num = 0
-    print("开始处理视频...")
+    print(f"开始处理视频 for camera {camera}...")
     
     while True:
+        # Check if stop event was triggered
+        if stop_event and stop_event.is_set():
+            print(f"停止信号接收到，结束处理视频 for camera {camera}")
+            break
+        
         ret, frame = cap.read()
         if not ret:
+            print(f"视频处理完毕 for camera {camera}")
             break
         
         frame_num += 1
         if frame_num % 15 != 0:
             continue
 
-        print(f"已处理 {frame_num} 帧")
+        print(f"已处理 {frame_num} 帧 for camera {camera}")
         
         timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, config['timestamp'][0], config['timestamp'][1])
 
@@ -220,11 +222,12 @@ def track_video(camera, command,  device='cuda'):
                         'class_id': int(class_id),
                         'confidence': float(confidence),
                         'red_light': red_light,
-                        'timestamp': timestamp
+                        'timestamp': timestamp,
+                        'camera': camera
                     }
 
                     # 将检测数据添加到Redis列表中
-                    redis_connection.lpush('video', json.dumps(detection_data))
+                    redis_connection.lpush(f'video:{camera}', json.dumps(detection_data))
                     
                     # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
                     line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
@@ -236,12 +239,7 @@ def track_video(camera, command,  device='cuda'):
 
     # 6. 释放资源
     cap.release()
-
-    # 保存原始文本格式到Redis，用于兼容性（可选）
-    # 将lines作为一个整体字符串保存到Redis
-    # full_text = ''.join(lines)
-    # r.set(f'{video_path}:text', full_text)
-
+    print(f"视频处理完成 for camera {camera}")
 
 
 # Create FastAPI app instance
@@ -252,7 +250,8 @@ app = FastAPI(title="Video Processing API", description="API for video processin
 async def startup_event():
     """Load models when the application starts"""
     print("正在启动服务并装载模型...")
-    load_models()
+    # Models are now loaded before the server starts, so this is kept for compatibility
+    # with other startup events if needed in the future
     print("服务启动完成！")
 
 
@@ -275,23 +274,41 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
     Returns:
         dict: Response with the action taken
     """
-    # Load configuration for the specified camera if not already loaded
-    if camera not in configurations:
-        conf_file = f"{camera}.json"
-        try:
-            with open(conf_file, 'rt') as f:
-                configurations[camera] = json.load(f)
-            print(f"Loaded configuration for camera {camera}")
-        except FileNotFoundError:
-            return {"error": f"Configuration file {conf_file} not found"}
-        except json.JSONDecodeError:
-            return {"error": f"Invalid JSON in configuration file {conf_file}"}
+    global active_processes
     
     # Process the command
     if command == "start":
         print(f"Starting processing for camera {camera}")
-        # Here you would typically start video processing for the camera
-        # For now, just returning a success message
+        
+        # Check if the camera is already being processed
+        if camera in active_processes:
+            if active_processes[camera]['running']:
+                return {
+                    "camera": camera,
+                    "command": command,
+                    "status": "already_running",
+                    "message": f"Camera {camera} is already being processed"
+                }
+        
+        # Create a stop event for this camera
+        stop_event = threading.Event()
+        
+        # Create a thread for video processing
+        video_thread = threading.Thread(
+            target=track_video, 
+            args=(camera, stop_event)
+        )
+        
+        # Store the thread and stop event
+        active_processes[camera] = {
+            'thread': video_thread,
+            'stop_event': stop_event,
+            'running': True
+        }
+        
+        # Start the video processing thread
+        video_thread.start()
+        
         return {
             "camera": camera,
             "command": command,
@@ -300,13 +317,30 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
         }
     elif command == "stop":
         print(f"Stopping processing for camera {camera}")
-        # Here you would typically stop video processing for the camera
-        # For now, just returning a success message
+        
+        # Check if the camera is currently being processed
+        if camera not in active_processes or not active_processes[camera]['running']:
+            return {
+                "camera": camera,
+                "command": command,
+                "status": "not_running",
+                "message": f"Camera {camera} is not currently being processed"
+            }
+        
+        # Set the stop event to signal the thread to stop
+        active_processes[camera]['stop_event'].set()
+        
+        # Optionally wait for the thread to finish (with timeout)
+        # active_processes[camera]['thread'].join(timeout=5)  # Wait up to 5 seconds
+        
+        # Mark as not running anymore
+        active_processes[camera]['running'] = False
+        
         return {
             "camera": camera,
             "command": command,
             "status": "processing_stopped", 
-            "message": f"Stopped processing for camera {camera}"
+            "message": f"Stop signal sent for camera {camera}"
         }
     else:
         return {"error": "Invalid command. Use 'start' or 'stop'"}
@@ -327,6 +361,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"错误: 无法连接到Redis服务器: {e}")
         exit()
+
+    # Load models before starting the server
+    print("正在启动服务并装载模型...")
+    load_models()
+    print("模型装载完成！")
 
     # device = 'cuda'
         
