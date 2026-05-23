@@ -1,13 +1,21 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
-import sys
 import redis
 import json
 from tell_time import recognize_timestamp_cv2,recognize_timestamp_easyocr
 from pathlib import Path
 import time
 import easyocr
+from fastapi import FastAPI, Query
+from typing import Optional
+import asyncio
+import threading
+
+# Global variables to store pre-loaded models
+yolo_model = None
+easyocr_reader = None
+configurations = {}
 
 def is_red_light_on(img, position):
     """
@@ -110,7 +118,21 @@ def is_red_light_on_by_brightness(img, position, brightness_threshold=100):
     return red_ratio > 0.1
 
 
-def track_video(video_path,  model, config,  device='cuda', redis_host='localhost', redis_port=6379, redis_db=0):
+def load_models():
+    """Function to pre-load both YOLO and EasyOCR models"""
+    global yolo_model, easyocr_reader
+    
+    print("正在装入检测模型...")
+    yolo_model = YOLO('best.pt')
+    
+    print("正在装入OCR模型...")
+    easyocr_reader = easyocr.Reader(['en'], gpu=True,
+                               model_storage_directory="./models",
+                               download_enabled=False)  # 禁止下载，使用本地模型
+    print("模型装载完成！")
+
+
+def track_video(camera, command,  device='cuda'):
     """
     使用YOLO模型对视频进行目标跟踪，并将结果保存到Redis。
 
@@ -124,23 +146,18 @@ def track_video(video_path,  model, config,  device='cuda', redis_host='localhos
         redis_db (int): Redis数据库编号
     """
 
-    # 连接到Redis
+    cfg_file = f'config/{camera}.json'
     try:
-        r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
-        # 测试连接
-        r.ping()
-        print(f"已连接到Redis服务器: {redis_host}:{redis_port}, DB: {redis_db}")
-    except Exception as e:
-        print(f"错误: 无法连接到Redis服务器: {e}")
+        with open(cfg_file) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"错误: 找不到配置文件 {cfg_file}")
         return
 
-    reader = easyocr.Reader(['en'], gpu=True,
-                               model_storage_directory="./models",
-                               download_enabled=False)  # 禁止下载，使用本地模
     # 2. 打开视频文件
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(config['source'])
     if not cap.isOpened():
-        print(f"错误: 无法打开视频文件 {video_path}")
+        print(f"错误: 无法打开视频文件 {config['source']}")
         return
 
     # 获取视频信息
@@ -148,8 +165,9 @@ def track_video(video_path,  model, config,  device='cuda', redis_host='localhos
     fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"视频信息: 总帧数={total_frames}, FPS={fps:.2f}")
 
+    global yolo_model, redis_connection
     # 清空之前可能存在的video相关的数据
-    r.delete('video')
+    redis_connection.delete('video')
     
     frame_num = 0
     print("开始处理视频...")
@@ -165,14 +183,13 @@ def track_video(video_path,  model, config,  device='cuda', redis_host='localhos
 
         print(f"已处理 {frame_num} 帧")
         
-        timestamp = recognize_timestamp_easyocr(frame, reader, config['timestamp'][0], config['timestamp'][1])
+        timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, config['timestamp'][0], config['timestamp'][1])
 
         red_light = is_red_light_on_by_brightness(frame, config['light'])
 
-
         # 4. 对当前帧进行跟踪
         # persist=True 确保目标ID在帧间保持一致
-        results = model.track(source=frame, persist=True, verbose=False)
+        results = yolo_model.track(source=frame, persist=True, verbose=False)
 
         # 5. 解析并写入跟踪结果
         for result in results:
@@ -207,13 +224,12 @@ def track_video(video_path,  model, config,  device='cuda', redis_host='localhos
                     }
 
                     # 将检测数据添加到Redis列表中
-                    r.lpush('video', json.dumps(detection_data))
+                    redis_connection.lpush('video', json.dumps(detection_data))
                     
                     # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
                     line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
                     print(line)
 
-            
             # 可选：在控制台打印进度
             # if frame_num % 30 == 0: # 每30帧打印一次
             #     print(f"已处理帧: {frame_num} / {total_frames}")
@@ -225,22 +241,98 @@ def track_video(video_path,  model, config,  device='cuda', redis_host='localhos
     # 将lines作为一个整体字符串保存到Redis
     # full_text = ''.join(lines)
     # r.set(f'{video_path}:text', full_text)
-    
 
-# --- 主程序 ---
+
+
+# Create FastAPI app instance
+app = FastAPI(title="Video Processing API", description="API for video processing with YOLO and EasyOCR")
+
+
+@app.on_event('startup')
+async def startup_event():
+    """Load models when the application starts"""
+    print("正在启动服务并装载模型...")
+    load_models()
+    print("服务启动完成！")
+
+
+@app.get("/")
+async def root():
+    """Root endpoint to verify the service is running"""
+    return {"message": "Video Processing API is running!"}
+
+
+@app.get("/control")
+async def control_camera(camera: str = Query(..., description="Camera identifier string"), 
+                        command: str = Query(..., regex="^(start|stop)$", description="Command: 'start' or 'stop'")):
+    """
+    Control endpoint to handle camera commands.
+    
+    Args:
+        camera (str): Camera identifier string
+        command (str): Command - either 'start' or 'stop'
+    
+    Returns:
+        dict: Response with the action taken
+    """
+    # Load configuration for the specified camera if not already loaded
+    if camera not in configurations:
+        conf_file = f"{camera}.json"
+        try:
+            with open(conf_file, 'rt') as f:
+                configurations[camera] = json.load(f)
+            print(f"Loaded configuration for camera {camera}")
+        except FileNotFoundError:
+            return {"error": f"Configuration file {conf_file} not found"}
+        except json.JSONDecodeError:
+            return {"error": f"Invalid JSON in configuration file {conf_file}"}
+    
+    # Process the command
+    if command == "start":
+        print(f"Starting processing for camera {camera}")
+        # Here you would typically start video processing for the camera
+        # For now, just returning a success message
+        return {
+            "camera": camera,
+            "command": command,
+            "status": "processing_started",
+            "message": f"Started processing for camera {camera}"
+        }
+    elif command == "stop":
+        print(f"Stopping processing for camera {camera}")
+        # Here you would typically stop video processing for the camera
+        # For now, just returning a success message
+        return {
+            "camera": camera,
+            "command": command,
+            "status": "processing_stopped", 
+            "message": f"Stopped processing for camera {camera}"
+        }
+    else:
+        return {"error": "Invalid command. Use 'start' or 'stop'"}
+
+
+# --- Main program for backward compatibility ---
 if __name__ == "__main__":
-    # 配置你的视频路径和输出文件路径
-    input_video = sys.argv[1]           #"your_video.mp4"  # 替换为你的视频文件路径
-    output_file = "results.txt"     # 替换为你想要的输出文件名
-    
-    conf_file = Path(input_video).stem + ".json"
-    with open(conf_file, 'rt') as f:
-        confs = json.load(f)
+    # 连接到Redis
+    try:
+        redis_host = "localhost"
+        redis_port = 6379
+        redis_db = 0
+        global redis_connection
+        redis_connection = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+        # 测试连接
+        # redis_connection.ping()
+        print(f"已连接到Redis服务器: {redis_host}:{redis_port}, DB: {redis_db}")
+    except Exception as e:
+        print(f"错误: 无法连接到Redis服务器: {e}")
+        exit()
 
-    print("正在装入检测模型")
-    # 可以通过第三个参数指定设备，例如使用GPU: device='cuda'
-    device = 'cuda' if len(sys.argv) < 3 else sys.argv[2]  # 默认使用GPU，如果提供了命令行参数则使用该参数指定的设备
-    model = YOLO('best.pt')
-    
-    # 运行跟踪函数
-    track_video(input_video, model, config = confs,  device=device)
+    # device = 'cuda'
+        
+        # Run tracking function
+        # track_video(input_video, yolo_model, config = confs,  device=device)
+
+    # Start the FastAPI server if no arguments provided
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
