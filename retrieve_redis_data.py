@@ -1,7 +1,6 @@
 import redis
 import json
 import time
-import threading
 from collections import defaultdict
 from typing import List, Tuple
 import sqlite3
@@ -10,21 +9,16 @@ import json
 from pathlib import Path
 
 class RedisDataRetriever:
-    def __init__(self, video_name, redis_host='localhost', redis_port=6379, redis_db=0, db_path='violations.db'):
+    def __init__(self, video_name, redis_connection, db_path='violations.db'):
         """
         初始化Redis连接和SQLite数据库
         """
         self.video_name = video_name
+
+        #每个视频一个表，视频名就是表名
         self.table_name = f"video_{video_name.replace('-', '_').replace('.', '_')}"  # 表名规范化
         
-        try:
-            self.r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
-            # 测试连接
-            self.r.ping()
-            print(f"已连接到Redis服务器: {redis_host}:{redis_port}, DB: {redis_db}")
-        except Exception as e:
-            print(f"错误: 无法连接到Redis服务器: {e}")
-            raise
+        self.r = redis_connection
             
         self.db_path = db_path
         self.init_database()
@@ -459,8 +453,20 @@ def main():
         print("请提供视频名称作为参数")
         return
     
+    redis_host = "localhost"
+    redis_port = 6379
+    redis_db = 0
+    try:
+        redis_connection = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+        # 测试连接
+        redis_connection.ping()
+        print(f"已连接到Redis服务器: {redis_host}:{redis_port}, DB: {redis_db}")
+    except Exception as e:
+        print(f"错误: 无法连接到Redis服务器: {e}")
+        exit()
+
     video_name = sys.argv[1]
-    retriever = RedisDataRetriever(video_name)
+    retriever = RedisDataRetriever(video_name, redis_connection)
     
     print(f"[{video_name}] 开始监控Redis数据...")
     print("处理规则:")
