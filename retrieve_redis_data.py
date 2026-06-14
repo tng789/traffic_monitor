@@ -57,7 +57,8 @@ class RedisDataRetriever:
         """
         with open(self.video_name) as f:
             conf = json.load(f)
-        pass
+        return conf
+        
     def insert_violation_record(self, frame_id, timestamp, traffic_volume, track_id, x1, y1, x2, y2, red_light_status, violation):
         """
         插入违规记录到数据库的指定表

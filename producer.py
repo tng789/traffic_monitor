@@ -4,13 +4,19 @@ import numpy as np
 import redis
 import json
 from tell_time import recognize_timestamp_easyocr
-from pathlib import Path
+# from pathlib import Path
 from datetime import datetime, timedelta
 import easyocr
 from fastapi import FastAPI, Query 
-from typing import Optional, Annotated
-import asyncio
+# from typing import Optional, Annotated
+# import asyncio
 import threading
+
+import time
+from confluent_kafka import Producer
+from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC_PREFIX, PRODUCER_ACKS
+
+from fixed_fifo import FixedFIFO
 
 # Global variables to store pre-loaded models
 yolo_model = None
@@ -18,73 +24,38 @@ easyocr_reader = None
 configurations = {}
 active_processes = {}  # Dictionary to keep track of active video tracking processes
 
-def is_red_light_on(img, position):
-    """
-    判断交通灯中的红灯是否亮起
+class CameraDataProducer:
+    def __init__(self, camera_id: str):
+        self.camera_id = camera_id
+        self.topic = f"{KAFKA_TOPIC_PREFIX}_{camera_id}"
+        self.producer = Producer({
+            'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+            'acks': PRODUCER_ACKS,
+        })
     
-    Args:
-        img: cv2图像
-        x1, y1: 区域左上角坐标
-        x2, y2: 区域右下角坐标
+    def send_data(self, data_id: str, timestamp: float = None):
+        """发送一条数据"""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        message = {
+            'camera': self.camera_id,
+            'id': data_id,
+            'timestamp': timestamp,
+        }
+        
+        # 按 camera_id 作为 key，确保同一 camera 的数据进入同一分区
+        self.producer.produce(
+            topic=self.topic,
+            key=self.camera_id,
+            value=json.dumps(message),
+        )
+        self.producer.poll(0)  # 触发回调
     
-    Returns:
-        bool: True表示红灯亮，False表示红灯未亮
-    """
-    # 提取感兴趣区域
-    x1, y1, x2, y2 = position
-    roi = img[int(y1):int(y2), int(x1):int(x2)]
-    
-    # 转换为HSV色彩空间，便于颜色检测
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # 定义红色范围（HSV空间）
-    # 注意：红色在HSV中有两个范围，因为HSV是一个圆柱坐标系
-    lower_red1 = np.array([0, 50, 50])
-    upper_red1 = np.array([10, 255, 255])
-    mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
-    
-    lower_red2 = np.array([170, 50, 50])
-    upper_red2 = np.array([180, 255, 255])
-    mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
-    
-    # 合并两个掩码
-    red_mask = cv2.add(mask1, mask2)
-    
-    # 计算红色区域占总区域的比例
-    height, width = red_mask.shape
-    total_pixels = height * width
-    red_pixels = cv2.countNonZero(red_mask)
-    
-    # 设置阈值，如果红色像素占比超过此阈值，则认为红灯亮起
-    # 这个阈值可能需要根据实际情况调整
-    red_ratio = red_pixels / total_pixels if total_pixels > 0 else 0
-    
-    # 返回判断结果，这里使用0.1作为阈值，即10%的区域为红色就认为灯亮了
-    # 可以根据实际测试情况调整这个阈值
-    return red_ratio > 0.1
-def red(img):
-
-    #    # 在彩色图像的情况下，解码图像将以b g r顺序存储通道。
-    grid_RGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    #    # 从RGB色彩空间转换到HSV色彩空间，从HSV查找颜色，
-    #H的范围 0~180， S 0~255  V 0~255
-    grid_HSV = cv2.cvtColor(grid_RGB, cv2.COLOR_RGB2HSV)
-    # H、S、V范围一：
-    #红色有两个范围，红色的H有两个范围（0-10和156-180），H 43~255， V 46~255
-    lower1 = np.array([0,43,46])
-    upper1 = np.array([10,255,255])
-    mask1 = cv2.inRange(grid_HSV, lower1, upper1)       # mask1 为二值图像
-    # H、S、V范围二：
-    lower2 = np.array([156,43,46])
-    upper2 = np.array([180,255,255])
-    mask2 = cv2.inRange(grid_HSV, lower2, upper2)
-    # 将两个二值图像结果 相加
-    mask3 = mask1 + mask2
-    # cv2.imwrite("mask.jpg",mask3)
-    reds = np.count_nonzero(mask3==255)
-    height, width,_ = img.shape
-    return True if reds*4> height * width else False
-def lightup(img):
+    def flush(self):
+        """确保所有消息已发送"""
+        self.producer.flush()
+def lit(img):
     '''tell that if the light at the specific area(img) are lit
     '''
     #img, opened by cv2.imread
@@ -99,61 +70,6 @@ def lightup(img):
     else:
         return False
 
-def is_red_light_on_by_brightness(img, position, brightness_threshold=100):
-    """
-    通过亮度判断交通灯中的红灯是否亮起
-    此方法首先检测交通灯区域的整体亮度，然后在高亮区域中查找红色像素
-    
-    Args:
-        img: cv2图像
-        x1, y1: 区域左上角坐标
-        x2, y2: 区域右下角坐标
-        brightness_threshold: 亮度阈值，用于判断灯是否亮起
-    
-    Returns:
-        bool: True表示红灯亮，False表示红灯未亮
-    """
-    # 提取感兴趣区域
-    x1, y1, x2, y2 = position
-    roi = img[int(y1):int(y2), int(x1):int(x2)]
-    roi = img[int(y1):int(y2), int(x1):int(x2)]
-    
-    # 转换为灰度图以测量亮度
-    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    
-    # 计算平均亮度
-    avg_brightness = cv2.mean(gray_roi)[0]
-    
-    # 如果整体亮度低于阈值，说明灯可能是灭的
-    if avg_brightness < brightness_threshold:
-        return False
-    
-    # 如果亮度足够高，进一步确认是否为红色
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # 定义红色范围（HSV空间）
-    lower_red1 = np.array([0, 50, 50])
-    upper_red1 = np.array([10, 255, 255])
-    mask1 = cv2.inRange(hsv_roi, lower_red1, upper_red1)
-    
-    lower_red2 = np.array([170, 50, 50])
-    upper_red2 = np.array([180, 255, 255])
-    mask2 = cv2.inRange(hsv_roi, lower_red2, upper_red2)
-    
-    # 合并两个掩码
-    red_mask = cv2.add(mask1, mask2)
-    
-    # 计算红色区域占总区域的比例
-    height, width = red_mask.shape
-    total_pixels = height * width
-    red_pixels = cv2.countNonZero(red_mask)
-    
-    # 如果红色像素比例超过一定阈值（比如10%），则认为是红灯亮起
-    red_ratio = red_pixels / total_pixels if total_pixels > 0 else 0
-    
-    return red_ratio > 0.1
-
-
 def load_models():
     """Function to pre-load both YOLO and EasyOCR models"""
     global yolo_model, easyocr_reader
@@ -166,7 +82,6 @@ def load_models():
                                model_storage_directory="./models",
                                download_enabled=False)  # 禁止下载，使用本地模型
     print("模型装载完成！")
-
 
 def track_video(camera, stop_event=None, device='cuda', pace = 3):
     """
@@ -200,14 +115,33 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
     # 清空之前可能存在的video相关的数据
     redis_connection.delete(f'video:{camera}')
     
+    print(f"开始预处理视频 for camera {camera}...")
+
+    timestamp = None
+    redlight_queue = FixedFIFO(maxlen=(fps/pace)//2 + 1)
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"视频处理完毕 或者 处理视频出错 {camera}")
+            break
+        timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, config['timestamp'][0], config['timestamp'][1])
+        red_light_area = frame[config['light'][1]:config['light'][3], config['light'][0]:config['light'][2]]
+        red_light = lit(red_light_area)
+        redlight_queue.push(red_light)
+
+        if  timestamp is not None and redlight_queue.is_full():
+            break
+    
+    print(f"开始处理视频 for camera {camera}...")
     frame_num = 0
     interval = 1000 // fps * pace
     std_timestamp = datetime.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
     last_frame_timestamp_obj = std_timestamp
 
-    print(f"开始处理视频 for camera {camera}...")
-    
-    lines = []
+    producer = CameraDataProducer(camera)
+
+    # lines = []
     while True:
         # Check if stop event was triggered
         if stop_event and stop_event.is_set():
@@ -237,11 +171,16 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
 
         
         red_light_area = frame[config['light'][1]:config['light'][3], config['light'][0]:config['light'][2]]
-        red_light = lightup(red_light_area)
+        red_light = lit(red_light_area)
 
+        redlight_queue.push(red_light)
+
+        if not red_light: # 如果当前帧没有红灯，则检查上一帧和前两帧是否有红灯
+            if redlight_queue.get(-2) or redlight_queue.get(-3):
+                red_light = True
+        
 
         # 4. 对当前帧进行跟踪
-        # persist=True 确保目标ID在帧间保持一致
         results = yolo_model.track(source=frame, persist=True, verbose=False)
 
         # 5. 解析并写入跟踪结果
@@ -282,9 +221,14 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                     
                     # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
                     # line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
-                    line = json.dumps(detection_data)
+                            # 按 camera_id 作为 key，确保同一 camera 的数据进入同一分区
+                    producer.produce(topic=camera, key=camera, value = json.dumps(detection_data))
+                    
+                    producer.poll(0)  # 触发回调
+                    
+                    # line = json.dumps(detection_data)
                     # print(line)
-                    lines.append(line)
+                    # lines.append(line)
 
             # 可选：在控制台打印进度
         if frame_num % 30 == 0: # 每30帧打印一次
@@ -296,8 +240,8 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
     cap.release()
     print(f"视频处理完成 for camera {camera}")
     # 把lines保存到文件 
-    with open(f'time_redlight_{camera}.txt', 'w') as f:
-        f.writelines(lines)
+    # with open(f'time_redlight_{camera}.txt', 'w') as f:
+        # f.writelines(lines)
 
 
 # Create FastAPI app instance with lifespan
