@@ -2,14 +2,13 @@ import json
 import time
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
-from confluent_kafka import Consumer, KafkaException, TopicPartition
+from confluent_kafka import Consumer, KafkaException, KafkaError, TopicPartition
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_PREFIX,
     BATCH_SIZE,
     BUFFER_SIZE,
     POLL_TIMEOUT,
-    MAX_POLL_RECORDS,
 )
 
 
@@ -24,7 +23,6 @@ class CameraDataConsumer:
             'group.id': self.group_id,
             'auto.offset.reset': 'earliest',  # 从头开始消费
             'enable.auto.commit': False,      # 手动提交 offset
-            'max.poll.records': MAX_POLL_RECORDS,
         })
         self.consumer.subscribe([self.topic])
     
@@ -47,7 +45,7 @@ class CameraDataConsumer:
                 # 超时，没有更多数据
                 break
             elif msg.error():
-                if msg.error().code() == KafkaException._PARTITION_EOF:
+                if msg.error().code() == KafkaError.PARTITION_EOF:
                     # 到达分区末尾
                     break
                 else:
@@ -78,9 +76,9 @@ class CameraDataConsumer:
         """
         步骤2：遍历数据，按规则提取并返回需要删除的 offset 列表
         
-        规则：从头遍历，若第一条数据的 id 为 A，
-        且最后一条 id 为 A 的数据没有出现在末尾 60 条中，
-        则所有 id 为 A 的数据全部提取处理并从 Redis 删除。
+        规则：从头遍历，若第一条数据的 track_id 为 A，
+        且最后一条 track_id 为 A 的数据没有出现在末尾 60 条中，
+        则所有 track_id 为 A 的数据全部提取处理并从 Redis 删除。
         重复直到遍历完。
         """
         if len(messages) <= BUFFER_SIZE:
@@ -90,21 +88,21 @@ class CameraDataConsumer:
         offsets_to_delete = []
         remaining = messages[:-BUFFER_SIZE]  # 可处理区域（排除末尾缓冲区）
         buffer_zone = messages[-BUFFER_SIZE:]  # 末尾缓冲区
-        buffer_ids = {m['data']['id'] for m in buffer_zone}
+        buffer_ids = {m['data']['track_id'] for m in buffer_zone}
         
         i = 0
         while i < len(remaining):
-            current_id = remaining[i]['data']['id']
+            current_id = remaining[i]['data']['track_id']
             
-            # 找到该 id 在 remaining 中的最后一条
+            # 找到该 track_id 在 remaining 中的最后一条
             last_idx = i
             for j in range(i, len(remaining)):
-                if remaining[j]['data']['id'] == current_id:
+                if remaining[j]['data']['track_id'] == current_id:
                     last_idx = j
             
-            # 检查该 id 的最后一条是否出现在末尾缓冲区中
+            # 检查该 track_id 的最后一条是否出现在末尾缓冲区中
             if current_id not in buffer_ids:
-                # 符合条件：提取所有该 id 的数据并标记删除
+                # 符合条件：提取所有该 track_id 的数据并标记删除
                 for j in range(i, last_idx + 1):
                     offsets_to_delete.append(remaining[j]['offset'])
                     # 在这里调用你的业务处理逻辑
@@ -121,7 +119,7 @@ class CameraDataConsumer:
     def _handle_data(self, data: Dict[str, Any]):
         """业务处理逻辑（用户自定义）"""
         # TODO: 在这里实现你的业务处理
-        print(f"Processing: camera={data['camera']}, id={data['id']}, timestamp={data['timestamp']}")
+        print(f"Processing: camera={data['camera']}, track_id={data['track_id']}, timestamp={data['timestamp']}")
     
     def _commit_offsets(self, offsets: List[int]):
         """提交已处理的 offset"""

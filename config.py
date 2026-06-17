@@ -1,6 +1,6 @@
 # Kafka 配置
 KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
-KAFKA_TOPIC_PREFIX = 'camera_'  # Topic 命名前缀
+KAFKA_TOPIC_PREFIX = 'camera'  # Topic 命名前缀
 
 # 消费参数
 BATCH_SIZE = 750          # 每次最多取多少条
