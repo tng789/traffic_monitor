@@ -115,104 +115,124 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
     std_timestamp = datetime.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
     last_frame_timestamp_obj = std_timestamp
 
-
-    # lines = []
-    while True:
-        # Check if stop event was triggered
-        if stop_event and stop_event.is_set():
-            print(f"停止信号接收到，结束处理视频 for camera {camera}")
-            break
-        
-        ret, frame = cap.read()
-        if not ret:
-            print(f"视频处理完毕 for camera {camera}")
-            break
-        
-        frame_num += 1
-        if frame_num % pace != 0:             # 每隔pace帧处理一次,这个地方要详细考虑一下，当前测试视频并未到每秒25帧。
-            continue
-        
-        timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, timestamp_area_left, timestamp_area_bottom)
-        # print(f"帧 {frame_num} 识别到的时间戳: {timestamp}")
-
-        if timestamp is None :
-            if last_frame_timestamp_obj == std_timestamp:
+    try:
+        while True:
+            # Check if stop event was triggered
+            if stop_event and stop_event.is_set():
+                print(f"停止信号接收到，结束处理视频 for camera {camera}")
+                break
+            
+            ret, frame = cap.read()
+            if not ret:
+                print(f"视频处理完毕 for camera {camera}")
+                break
+            
+            frame_num += 1
+            if frame_num % pace != 0:             # 每隔pace帧处理一次,这个地方要详细考虑一下，当前测试视频并未到每秒25帧。
                 continue
-            else:
-                timestamp_obj = last_frame_timestamp_obj + timedelta(milliseconds=interval)
-                timestamp = timestamp_obj.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                
-        last_frame_timestamp_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
+            
+            timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, timestamp_area_left, timestamp_area_bottom)
+            # print(f"帧 {frame_num} 识别到的时间戳: {timestamp}")
 
-        
-        red_light_area = frame[readlight_y1: redlight_y2, redlight_x1:redlight_x2]
-        red_light = lit(red_light_area)
-
-        redlight_queue.push(red_light)
-
-        #在红灯灭之前，会闪烁半秒时间，按照13帧每秒，则闪烁大约6帧，若pace为3即3帧取1帧，则闪烁2帧。
-        # 因此，如果当前帧不是红灯，则检查上一帧和前两帧是否是红灯
-        if not red_light: 
-            if redlight_queue.get(-2) or redlight_queue.get(-3):
-                red_light = True
-        
-
-        # 4. 对当前帧进行跟踪
-        results = yolo_model.track(source=frame, persist=True, verbose=False, conf=0.45)
-
-        # 5. 解析并写入跟踪结果
-        for result in results:
-            # 检查是否有跟踪框
-            if result.boxes is not None and result.boxes.id is not None:
-                boxes = result.boxes
-                # 获取边界框坐标 (x1, y1, x2, y2), 置信度, 类别ID, 跟踪ID
-                # xyxy 是左上角和右下角坐标
-                xyxy = boxes.xyxy.cpu().numpy()
-                conf = boxes.conf.cpu().numpy()
-                cls = boxes.cls.cpu().numpy()
-                track_id = boxes.id.cpu().numpy()
-
-                for i in range(len(xyxy)):
-                    x1, y1, x2, y2 = xyxy[i]
-                    confidence = conf[i]
-                    class_id = int(cls[i])
-                    id = int(track_id[i])
+            if timestamp is None :
+                if last_frame_timestamp_obj == std_timestamp:
+                    continue
+                else:
+                    timestamp_obj = last_frame_timestamp_obj + timedelta(milliseconds=interval)
+                    timestamp = timestamp_obj.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                     
-                    # 创建数据对象
-                    detection_data = {
-                        'frame_id': int(frame_num),
-                        'track_id': int(id),
-                        'x1': float(x1),
-                        'y1': float(y1),
-                        'x2': float(x2),
-                        'y2': float(y2),
-                        'class_id': int(class_id),
-                        'confidence': float(confidence),
-                        'red_light': red_light,
-                        'timestamp': timestamp,
-                        'camera': camera
-                    }
+            last_frame_timestamp_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
 
-                    # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
-                    # line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
+            
+            red_light_area = frame[readlight_y1: redlight_y2, redlight_x1:redlight_x2]
+            red_light = lit(red_light_area)
 
-                    #发送到rabbitmq        
-                    global producer
-                    producer.publish(camera, json.dumps(detection_data), ttl_ms=86400000) 
-                    
-                    # line = json.dumps(detection_data)
-                    # print(line)
-                    # lines.append(line)
+            redlight_queue.push(red_light)
 
-            # 可选：在控制台打印进度
-        if frame_num % 30 == 0: # 每30帧打印一次
-            print(f"已处理帧: {frame_num} / {total_frames}")
+            #在红灯灭之前，会闪烁半秒时间，按照13帧每秒，则闪烁大约6帧，若pace为3即3帧取1帧，则闪烁2帧。
+            # 因此，如果当前帧不是红灯，则检查上一帧和前两帧是否是红灯
+            if not red_light: 
+                if redlight_queue.get(-2) or redlight_queue.get(-3):
+                    red_light = True
+            
 
-        # last_frame_timestamp_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
+            # 4. 对当前帧进行跟踪
+            results = yolo_model.track(source=frame, persist=True, verbose=False, conf=0.45)
 
-    # 6. 释放资源
-    cap.release()
-    print(f"视频处理完成 for camera {camera}")
+            # 5. 解析并写入跟踪结果
+            for result in results:
+                # 检查是否有跟踪框
+                if result.boxes is not None and result.boxes.id is not None:
+                    boxes = result.boxes
+                    # 获取边界框坐标 (x1, y1, x2, y2), 置信度, 类别ID, 跟踪ID
+                    # xyxy 是左上角和右下角坐标
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    conf = boxes.conf.cpu().numpy()
+                    cls = boxes.cls.cpu().numpy()
+                    track_id = boxes.id.cpu().numpy()
+
+                    for i in range(len(xyxy)):
+                        x1, y1, x2, y2 = xyxy[i]
+                        confidence = conf[i]
+                        class_id = int(cls[i])
+                        id = int(track_id[i])
+                        
+                        # 创建数据对象
+                        detection_data = {
+                            'frame_id': int(frame_num),
+                            'track_id': int(id),
+                            'x1': float(x1),
+                            'y1': float(y1),
+                            'x2': float(x2),
+                            'y2': float(y2),
+                            'class_id': int(class_id),
+                            'confidence': float(confidence),
+                            'red_light': red_light,
+                            'timestamp': timestamp,
+                            'camera': camera
+                        }
+
+                        # 同时保留到lines数组中（为了兼容旧代码，但可以移除）
+                        # line = f"{frame_num}, {id}, {x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}, {class_id}, {confidence:.2f}\n"
+
+                        #发送到rabbitmq        
+                        global producer
+                        try:
+                            # 检查producer连接是否可用
+                            if (producer and 
+                                hasattr(producer, 'channel') and 
+                                producer.channel and 
+                                not getattr(producer.channel, 'is_closed', False)):
+                                producer.publish(camera, json.dumps(detection_data), ttl_ms=86400000) 
+                            else:
+                                print(f"RabbitMQ连接不可用，跳过发送数据 for camera {camera}")
+                        except Exception as e:
+                            print(f"发送数据到RabbitMQ失败: {e}")
+                            # 如果是连接错误，记录错误但继续处理视频
+                            # 这样可以确保视频处理完成，即使消息队列连接有问题
+                            error_str = str(e).lower()
+                            if 'connection' in error_str or 'channel' in error_str or 'stream' in error_str:
+                                print(f"检测到RabbitMQ连接问题，跳过发送数据并继续处理视频 for camera {camera}")
+                                
+                        # line = json.dumps(detection_data)
+                        # print(line)
+                        # lines.append(line)
+
+                # 可选：在控制台打印进度
+            if frame_num % 30 == 0: # 每30帧打印一次
+                print(f"已处理帧: {frame_num} / {total_frames}")
+            # last_frame_timestamp_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f")
+
+    finally:
+        # 6. 释放资源
+        cap.release()
+        print(f"视频处理完成 for camera {camera}")
+        
+        # Mark as not running anymore and clean up the process entry
+        if camera in active_processes:
+            active_processes[camera]['running'] = False
+            # Remove the entry from active_processes to allow restart
+            del active_processes[camera]
     # 把lines保存到文件 
     # with open(f'time_redlight_{camera}.txt', 'w') as f:
         # f.writelines(lines)
@@ -259,6 +279,11 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
                     "status": "already_running",
                     "message": f"Camera {camera} is already being processed"
                 }
+            # If the camera exists in active_processes but is not running, 
+            # it means the process has completed normally, so we can remove it and restart
+            else:
+                # Remove the old entry to allow restart
+                del active_processes[camera]
         
         # Create a stop event for this camera
         stop_event = threading.Event()
