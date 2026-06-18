@@ -154,11 +154,13 @@ class Track:
         points_in_red_light_area = []
         for data_point in track_data_list:
             if data_point['red_light']:  # Red light is on
-                x_center = (data_point['x1'] + data_point['x2']) / 2
-                y_center = (data_point['y1'] + data_point['y2']) / 2
+                # x_center = (data_point['x1'] + data_point['x2']) / 2
+                # y_center = (data_point['y1'] + data_point['y2']) / 2
                 
-                if self.point_in_polygon(x_center, y_center, red_light_area):
-                    points_in_red_light_area.append((x_center, y_center, data_point['frame_id']))
+                x = (data_point['x1'] + data_point['x2']) / 2
+                y = data_point['y2']
+                if self.point_in_polygon(x, y, red_light_area):
+                    points_in_red_light_area.append((x, y, data_point['frame_id']))
         
         if len(points_in_red_light_area) < 2:
             return False  # Need at least 2 points to determine direction
