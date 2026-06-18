@@ -8,14 +8,6 @@ import easyocr
 from fastapi import FastAPI, Query 
 import threading
 
-# from confluent_kafka import Producer
-# from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC_PREFIX, PRODUCER_ACKS
-
-import pika
-from pika.exceptions import AMQPConnectionError
-from pika.adapters.blocking_connection import BlockingChannel
-from pika.exchange_type import ExchangeType
-
 from rmq import Producer
 
 from fixed_fifo import FixedFIFO

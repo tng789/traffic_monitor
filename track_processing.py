@@ -150,13 +150,37 @@ class Track:
         :param red_light_area: Coordinates of the red light area
         :return: True if running red light is detected, False otherwise
         """
+        # Filter track points that are inside the red light area when red light is on
+        points_in_red_light_area = []
         for data_point in track_data_list:
             if data_point['red_light']:  # Red light is on
                 x_center = (data_point['x1'] + data_point['x2']) / 2
                 y_center = (data_point['y1'] + data_point['y2']) / 2
                 
                 if self.point_in_polygon(x_center, y_center, red_light_area):
-                    return True
+                    points_in_red_light_area.append((x_center, y_center, data_point['frame_id']))
+        
+        if len(points_in_red_light_area) < 2:
+            return False  # Need at least 2 points to determine direction
+        
+        # Sort by frame_id to get chronological order
+        points_in_red_light_area.sort(key=lambda x: x[2])
+        
+        # Get first and last points in the red light area
+        first_x, first_y, _ = points_in_red_light_area[0]
+        last_x, last_y, _ = points_in_red_light_area[-1]
+        
+        # Calculate movement distances
+        dx = abs(last_x - first_x)
+        dy = abs(last_y - first_y)
+        
+        # Check if the movement is primarily in the Y direction (vertical)
+        # and if the vehicle moved upward (from lower Y to higher Y)
+        if dy > dx:  # Primary movement is vertical
+            # Vehicle moving upward (Y decreases as we move up in image coordinates)
+            # So if last_y < first_y, it means the vehicle moved upward
+            if last_y < first_y:
+                return True
         
         return False
     
@@ -281,6 +305,12 @@ class track_processor:
             if last_frame_id is not None and abs(frame_id - last_frame_id) > self.frame_diff_threshold:
                 print(f"Frame difference exceeded threshold for track {existing_track_id}")
                 
+                # 此处应该增加一个判断，如果existing_track_obj里面轨迹数据少于某个阈值，则不处理，并且将track_id加入待删除名单。
+                if len(existing_track_obj.tracks) < 5:      #fps13, 每3帧取1帧，5相当于1秒多点。
+                    print(f"Track {existing_track_id} has less than 5 points, not processing")
+                    tracks_to_remove.append(existing_track_id)
+                    continue
+
                 # Call handle function for this track
                 existing_track_obj.handle()
                 
