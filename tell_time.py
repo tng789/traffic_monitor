@@ -1,8 +1,10 @@
 import cv2
-import pytesseract
 from datetime import datetime
 import time
-# import easyocr
+
+from app_log import get_logger
+
+logger = get_logger(__name__)
 
 # 配置 Tesseract 路径 (Windows下需要，Linux/Mac通常不需要)
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -15,7 +17,7 @@ def fix(timetext:str)->str:
     # 纠正之后还要再看看是否与样例的格式一致。如是， 返回符合样例的格式的timetext，如果不是，返回None
 
     import re
-    from datetime import datetime
+    # from datetime import datetime
     
     # Check if the input already matches the correct format (with milliseconds)
     correct_format_pattern = r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$'
@@ -166,29 +168,29 @@ def fix(timetext:str)->str:
         return formatted_time
     except ValueError:
         return None
-def recognize_timestamp_cv2(img):
-
-    #取图片的右上角1000*200大小的区域, 固定不变
-    # 2. 定义 ROI (Region of Interest)
-    roi  = img[0:200, 3000:]
-
-    # 3. 预处理
-    # 转灰度
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    # 二值化 (OTSU 自动阈值)
-    # 时间戳是白字，背景是深色/半透明，反转一下变成黑字白底通常更好识别
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # 可选：形态学操作去噪
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    # 4. OCR 识别
-    # 配置参数：--psm 7 表示将其视为单行文本，whitelist 只允许数字和标点
-    config = r'--psm 7 -c tessedit_char_whitelist=0123456789:-. '
-    text = pytesseract.image_to_string(binary, config=config)
-    
-    return text.strip()
+#def recognize_timestamp_cv2(img):
+#
+#    #取图片的右上角1000*200大小的区域, 固定不变
+#    # 2. 定义 ROI (Region of Interest)
+#    roi  = img[0:200, 3000:]
+#
+#    # 3. 预处理
+#    # 转灰度
+#    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+#    # 二值化 (OTSU 自动阈值)
+#    # 时间戳是白字，背景是深色/半透明，反转一下变成黑字白底通常更好识别
+#    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+#    
+#    # 可选：形态学操作去噪
+#    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+#    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+#
+#    # 4. OCR 识别
+#    # 配置参数：--psm 7 表示将其视为单行文本，whitelist 只允许数字和标点
+#    config = r'--psm 7 -c tessedit_char_whitelist=0123456789:-. '
+#    text = pytesseract.image_to_string(binary, config=config)
+#    
+#    return text.strip()
 
 
 def recognize_timestamp_easyocr(img, reader, widht=3000,height=200, model_storage_directory="./models"):
@@ -203,11 +205,11 @@ def recognize_timestamp_easyocr(img, reader, widht=3000,height=200, model_storag
 
     # 合并结果
 
-    result_str =  " ".join(result)
-
-    # dt = datetime.strptime(result_str, '%Y-%m-%d %H:%M:%S.%f')
-    # return dt
-    return fix(result_str)
+    result_str = " ".join(result)
+    fixed = fix(result_str)
+    if fixed is None and result_str.strip():
+        logger.debug("OCR 时间戳无法修正: raw=%r", result_str)
+    return fixed
 
 
 if __name__ == '__main__':

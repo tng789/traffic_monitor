@@ -1,5 +1,52 @@
 import json
+import sqlite3
 from collections import deque
+from datetime import datetime, timedelta
+
+from app_log import get_logger
+
+logger = get_logger(__name__)
+
+# Import WebSocket related components to send messages
+try:
+    from utils import websocket_connections, process_logs
+    import asyncio
+    from web_server import send_log_to_websocket
+except ImportError:
+    # If imports fail, define dummy functions to avoid errors
+    websocket_connections = {}
+    process_logs = {}
+    
+    async def send_log_to_websocket(websocket, log_entry):
+        pass
+
+
+def parse_message_timestamp(ts_str):
+    """Parse timestamp string from detection data."""
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(ts_str, fmt)
+        except (ValueError, TypeError):
+            continue
+    raise ValueError(f"Unsupported timestamp format: {ts_str!r}")
+
+
+def get_30min_window(dt):
+    """Return the 30-minute window (start at :00 or :30, end at :30 or :00) containing dt."""
+    if dt.minute < 30:
+        start = dt.replace(minute=0, second=0, microsecond=0)
+    else:
+        start = dt.replace(minute=30, second=0, microsecond=0)
+    return start, start + timedelta(minutes=30)
+
+
+def format_window_time(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sanitize_table_suffix(camera_id):
+    return camera_id.replace('-', '_').replace('.', '_')
+
 
 class Track:
     """
@@ -66,7 +113,7 @@ class Track:
             with open(config_file) as f:
                 config = json.load(f)
         except FileNotFoundError:
-            print(f"Configuration file {config_file} not found.")
+            logger.error("找不到相机配置文件 %s", config_file)
             return
         
         # 2. Check for wrong direction
@@ -217,49 +264,75 @@ class Track:
         :param camera_id: Camera ID for the table name
         :param violation_records: List of violation records to write
         """
-        import sqlite3
-        
-        # Create table name based on camera_id
         table_name = f"video_{camera_id.replace('-', '_').replace('.', '_')}"
-        
-        # Connect to database and create table if not exists
-        conn = sqlite3.connect('violations.db')
-        cursor = conn.cursor()
-        
-        create_table_sql = f'''
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                track_id INTEGER,
-                time TEXT,
-                x1 REAL,
-                y1 REAL,
-                x2 REAL,
-                y2 REAL,
-                violation INTEGER
-            )
-        '''
-        cursor.execute(create_table_sql)
-        
-        # Insert violation records
-        for record in violation_records:
-            first_data = record['first_data']
-            insert_sql = f'''
-                INSERT INTO {table_name} (
-                    track_id, time, x1, y1, x2, y2, violation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+
+        try:
+            conn = sqlite3.connect('violations.db')
+            cursor = conn.cursor()
+
+            create_table_sql = f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    track_id INTEGER,
+                    time TEXT,
+                    x1 REAL,
+                    y1 REAL,
+                    x2 REAL,
+                    y2 REAL,
+                    violation INTEGER
+                )
             '''
-            cursor.execute(insert_sql, (
-                self.track_id,
-                first_data['timestamp'],
-                first_data['x1'],
-                first_data['y1'],
-                first_data['x2'],
-                first_data['y2'],
-                record['type']
-            ))
-        
-        conn.commit()
-        conn.close()
+            cursor.execute(create_table_sql)
+
+            for record in violation_records:
+                first_data = record['first_data']
+                violation_type_map = {
+                    1: "单人不戴头盔",
+                    2: "双人戴头盔",
+                    3: "双人不戴头盔",
+                    4: "逆行",
+                    5: "闯红灯"
+                }
+                violation_desc = violation_type_map.get(record['type'], f"未知违规类型({record['type']})")
+                violation_msg = f"违规检测: track_id={self.track_id}, time={first_data['timestamp']}, violation={violation_desc}"
+                logger.info("camera=%s %s", camera_id, violation_msg)
+
+                try:
+                    import asyncio
+                    if camera_id in websocket_connections:
+                        for connection in websocket_connections[camera_id]:
+                            asyncio.create_task(send_log_to_websocket(connection, {
+                                'timestamp': first_data['timestamp'],
+                                'message': violation_msg
+                            }))
+                except Exception as e:
+                    logger.warning(
+                        "发送违规信息到 WebSocket 失败 camera=%s: %s", camera_id, e, exc_info=True
+                    )
+
+                insert_sql = f'''
+                    INSERT INTO {table_name} (
+                        track_id, time, x1, y1, x2, y2, violation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                '''
+                cursor.execute(insert_sql, (
+                    self.track_id,
+                    first_data['timestamp'],
+                    first_data['x1'],
+                    first_data['y1'],
+                    first_data['x2'],
+                    first_data['y2'],
+                    record['type']
+                ))
+
+            conn.commit()
+            conn.close()
+            logger.info(
+                "camera=%s 写入 %s 条违章记录到表 %s",
+                camera_id, len(violation_records), table_name,
+            )
+        except sqlite3.Error:
+            logger.exception("写入违章记录失败 camera=%s table=%s", camera_id, table_name)
 
 class track_processor:
     """
@@ -271,7 +344,79 @@ class track_processor:
         
         #ByteTrack默认30, 其实30次检测。如果每3帧取1帧的话， frame_diff应该是30*3
         self.frame_diff_threshold = 30  # Frame difference threshold
-        
+
+        # 30-minute detection statistics
+        self.stats_count = 0
+        self.stats_window_start = None
+        self.stats_window_end = None
+        logger.info("track_processor 初始化完成 camera_id=%s", camera_id)
+
+    def _parse_message_time(self, data):
+        ts = data.get('timestamp')
+        if ts:
+            try:
+                return parse_message_timestamp(ts)
+            except ValueError:
+                logger.warning("消息时间戳无效，使用当前时间: %s", ts)
+        return datetime.now()
+
+    def _ensure_stats_window(self, ts):
+        window_start, window_end = get_30min_window(ts)
+
+        if self.stats_window_start is None:
+            self.stats_window_start = window_start
+            self.stats_window_end = window_end
+            return
+
+        if ts >= self.stats_window_end:
+            self._flush_stats_to_db()
+            self.stats_count = 0
+            self.stats_window_start = window_start
+            self.stats_window_end = window_end
+
+    def _flush_stats_to_db(self):
+        if self.camera_id is None or self.stats_window_start is None:
+            return
+
+        table_name = f"data_{sanitize_table_suffix(self.camera_id)}"
+        try:
+            conn = sqlite3.connect('violations.db')
+            cursor = conn.cursor()
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time TEXT,
+                    end_time TEXT,
+                    total_count INTEGER
+                )
+            ''')
+            cursor.execute(
+                f'''
+                INSERT INTO {table_name} (start_time, end_time, total_count)
+                VALUES (?, ?, ?)
+                ''',
+                (
+                    format_window_time(self.stats_window_start),
+                    format_window_time(self.stats_window_end),
+                    self.stats_count,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            logger.info(
+                "统计数据已写入 %s: %s - %s, 检测总数=%s",
+                table_name,
+                format_window_time(self.stats_window_start),
+                format_window_time(self.stats_window_end),
+                self.stats_count,
+            )
+        except sqlite3.Error:
+            logger.exception(
+                "写入统计数据失败 camera_id=%s table=%s", self.camera_id, table_name
+            )
+
+    def _record_new_track(self):
+        self.stats_count += 1
     
     def process_message(self, rmq_data):
         """
@@ -281,18 +426,31 @@ class track_processor:
         try:
             data = json.loads(rmq_data)
         except json.JSONDecodeError:
-            print(f"Failed to decode JSON from message: {rmq_data}")
+            logger.error("消息 JSON 解析失败: %s", rmq_data[:200] if rmq_data else rmq_data)
+            return
+        except (TypeError, AttributeError):
+            if isinstance(rmq_data, dict):
+                data = rmq_data
+            else:
+                logger.error("不支持的消息类型: %s", type(rmq_data))
+                return
+
+        try:
+            track_id = data['track_id']
+            frame_id = data['frame_id']
+        except KeyError:
+            logger.error("消息缺少必要字段 track_id/frame_id: %s", data)
             return
 
-        track_id = data['track_id']
-        frame_id = data['frame_id']
+        # Advance stats window when message time crosses a 30-minute boundary
+        self._ensure_stats_window(self._parse_message_time(data))
         
         # Add data to existing track object or create new one
         if track_id not in self.current_tracks:
-            # Create new track object if this is a new track_id
+            self._record_new_track()
             new_track = Track(track_id)
             self.current_tracks[track_id] = new_track
-            print(f"Created new track for track_id: {track_id}")
+            logger.debug("新建 track track_id=%s camera=%s", track_id, self.camera_id)
         
         # Add data to the track (whether it's new or existing)
         track_obj = self.current_tracks[track_id]
@@ -305,11 +463,16 @@ class track_processor:
             # print(f"track_id={existing_track_id}, last_frame_id={last_frame_id}, current_frame_id={frame_id}")
             
             if last_frame_id is not None and abs(frame_id - last_frame_id) > self.frame_diff_threshold:
-                print(f"Frame difference exceeded threshold for track {existing_track_id}")
-                
-                # 此处应该增加一个判断，如果existing_track_obj里面轨迹数据少于某个阈值，则不处理，并且将track_id加入待删除名单。
-                if len(existing_track_obj.tracks) < 5:      #fps13, 每3帧取1帧，5相当于1秒多点。
-                    print(f"Track {existing_track_id} has less than 5 points, not processing")
+                logger.debug(
+                    "track_id=%s 帧间隔超限: last=%s current=%s threshold=%s",
+                    existing_track_id, last_frame_id, frame_id, self.frame_diff_threshold,
+                )
+
+                if len(existing_track_obj.tracks) < 5:
+                    logger.debug(
+                        "track_id=%s 轨迹点不足 (%s)，跳过处理",
+                        existing_track_id, len(existing_track_obj.tracks),
+                    )
                     tracks_to_remove.append(existing_track_id)
                     continue
 
@@ -322,5 +485,5 @@ class track_processor:
         # Remove all marked tracks from current_tracks
         for track_id_to_remove in tracks_to_remove:
             del self.current_tracks[track_id_to_remove]
-            print(f"Processed and removed track {track_id_to_remove}")
+            logger.debug("已处理并移除 track_id=%s", track_id_to_remove)
     

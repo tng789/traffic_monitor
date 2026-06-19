@@ -2,13 +2,132 @@ import pika
 import json
 import threading
 import time
-import logging
-
-from track_processing import track_processor
 import sys
+import argparse
+import psutil
+import os
+from track_processing import track_processor
+import subprocess
 
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from app_log import setup_logging, get_logger
 
+logger = get_logger(__name__)
+
+
+def get_process_by_camera_id(camera_id):
+    """
+    查找处理指定camera_id的进程
+    """
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            # 检查进程命令行是否包含我们的程序和指定的camera_id
+            cmdline = proc.info['cmdline']
+            if 'python' in cmdline[0]:
+                if len(cmdline) >= 4 and 'rmq.py' in cmdline[1] and 'start' in cmdline[2]  and cmdline[3] == camera_id:
+                    # 排除当前进程，只查找其他进程
+                    if proc.pid != current_pid:
+                        return proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except (IndexError, TypeError) as e:
+            logger.debug("跳过无法解析的进程信息: %s", e)
+            continue
+    return None
+
+
+def start_process(camera_id):
+    """
+    启动处理指定camera_id的进程
+    """
+    # 检查是否已经有处理该camera_id的进程在运行
+    existing_process = get_process_by_camera_id(camera_id)
+    if existing_process:
+        logger.warning(
+            "已存在处理 camera_id=%s 的进程 (PID=%s)，拒绝重复启动",
+            camera_id, existing_process.pid,
+        )
+        return False
+    
+    # 启动新的消费者进程
+    amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+
+    processor = track_processor(camera_id=camera_id)
+
+    consumer = Consumer(
+        amqp_url = amqp_url,
+        queue_name = camera_id,
+        routing_key_pattern = camera_id,
+        consumer_name = f'consumer_{camera_id}',
+        message_ttl_ms=86400000,   # 24小时
+        max_queue_length=10000,
+        max_retries=3
+    )
+    
+    thread_a = threading.Thread(target=consumer.consume, args=(processor.process_message,), daemon=True)
+    thread_a.start()
+
+    logger.info("已启动 camera_id=%s 的消费者线程 (PID=%s)", camera_id, os.getpid())
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("收到退出信号，停止 camera_id=%s 的消费者", camera_id)
+        return True
+
+
+def start_daemon_process(camera_id):
+    """
+    以守护进程方式启动处理指定camera_id的进程
+    """
+    # 检查是否已经有处理该camera_id的进程在运行
+    existing_process = get_process_by_camera_id(camera_id)
+    if existing_process:
+        logger.warning(
+            "已存在处理 camera_id=%s 的进程 (PID=%s)，拒绝重复启动",
+            camera_id, existing_process.pid,
+        )
+        return False
+
+    # 使用subprocess在后台启动新进程
+    cmd = [sys.executable, __file__, 'start', camera_id]
+    # 启动进程并在后台运行
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,  # 重定向输出到空设备
+        stderr=subprocess.DEVNULL,  # 重定向错误输出到空设备
+        stdin=subprocess.DEVNULL,   # 重定向输入到空设备
+        preexec_fn=os.setsid if os.name != 'nt' else None  # 在Unix系统上创建新会话组
+    )
+    
+    logger.info("已在后台启动 camera_id=%s 的消费者 (PID=%s)", camera_id, process.pid)
+    return True
+
+
+def stop_process(camera_id):
+    """
+    停止处理指定camera_id的进程
+    """
+    existing_process = get_process_by_camera_id(camera_id)
+    if existing_process:
+        try:
+            logger.info(
+                "终止 camera_id=%s 的消费者进程 PID=%s",
+                camera_id, existing_process.pid,
+            )
+            existing_process.terminate()
+            existing_process.wait(timeout=5)
+        except psutil.TimeoutExpired:
+            logger.warning("进程 PID=%s 未响应 terminate，强制 kill", existing_process.pid)
+            existing_process.kill()
+        except psutil.NoSuchProcess:
+            logger.warning("进程 PID=%s 已不存在", existing_process.pid)
+        logger.info("camera_id=%s 的消费者进程已终止", camera_id)
+        return True
+    else:
+        logger.warning("未找到 camera_id=%s 对应的消费者进程", camera_id)
+        return False
 
 
 # ===== 生产者（带连接重试）=====
@@ -29,10 +148,10 @@ class Producer:
                 params.connection_attempts = 3
                 params.retry_delay = 2
                 connection = pika.BlockingConnection(params)
-                logging.info("RabbitMQ 连接成功")
+                logger.info("RabbitMQ 连接成功")
                 return connection
             except Exception as e:
-                logging.warning(f"连接失败 (第{attempt + 1}次): {e}")
+                logger.warning("RabbitMQ 连接失败 (第%s次): %s", attempt + 1, e)
                 if attempt == self.max_retries - 1:
                     raise
                 time.sleep(2 ** attempt)  # 指数退避
@@ -73,7 +192,7 @@ class Producer:
             body=message.encode('utf-8'),
             properties=properties
         )
-        logging.info(f"[生产者] 发送: routing_key={routing_key}, data={data}, ttl={ttl_ms}ms")
+        logger.debug("[生产者] 发送 routing_key=%s ttl=%sms", routing_key, ttl_ms)
 
     def close(self):
         if self.connection and not self.connection.is_closed:
@@ -113,7 +232,13 @@ class Consumer:
         params.heartbeat = 30
         params.connection_attempts = 3
         params.retry_delay = 2
-        return pika.BlockingConnection(params)
+        try:
+            connection = pika.BlockingConnection(params)
+            logger.info("[%s] RabbitMQ 连接成功", self.consumer_name)
+            return connection
+        except Exception:
+            logger.exception("[%s] RabbitMQ 连接失败", self.consumer_name)
+            raise
 
     def _setup_exchanges(self):
         """声明主交换机和死信交换机"""
@@ -175,8 +300,11 @@ class Consumer:
             routing_key=self.routing_key_pattern
         )
 
-        logging.info(f"[{self.consumer_name}] 队列 '{self.queue_name}' 初始化完成")
-        logging.info(f"    死信队列: '{dlx_queue_name}', TTL: {message_ttl_ms}ms, 最大长度: {max_queue_length}")
+        logger.info(
+            "[%s] 队列 '%s' 初始化完成 (DLQ='%s', TTL=%sms, max_length=%s)",
+            self.consumer_name, self.queue_name, dlx_queue_name,
+            message_ttl_ms, max_queue_length,
+        )
 
     def consume(self, callback):
         """开始消费"""
@@ -186,11 +314,11 @@ class Consumer:
             on_message_callback=self._wrap_callback(callback),
             auto_ack=False
         )
-        logging.info(f"[{self.consumer_name}] 开始消费，等待消息...")
+        logger.info("[%s] 开始消费，等待消息...", self.consumer_name)
         try:
             self.channel.start_consuming()
         except KeyboardInterrupt:
-            logging.info(f"[{self.consumer_name}] 收到退出信号，正在关闭...")
+            logger.info("[%s] 收到退出信号，正在关闭...", self.consumer_name)
             self.channel.stop_consuming()
 
     def _wrap_callback(self, callback):
@@ -198,19 +326,22 @@ class Consumer:
             retry_count = self._get_retry_count(properties)
             try:
                 data = json.loads(body.decode('utf-8'))
-                logging.info(f"[{self.consumer_name}] 收到 (重试第{retry_count}次): {data}")
+                logger.debug(
+                    "[%s] 收到消息 track_id=%s frame_id=%s (重试第%s次)",
+                    self.consumer_name,
+                    data.get('track_id'),
+                    data.get('frame_id'),
+                    retry_count,
+                )
                 callback(data)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                logging.info(f"[{self.consumer_name}] 处理成功，已ACK")
-            except Exception as e:
-                logging.error(f"[{self.consumer_name}] 处理失败: {e}")
+            except Exception:
+                logger.exception("[%s] 消息处理失败 (重试第%s次)", self.consumer_name, retry_count)
                 if retry_count < self.max_retries:
-                    # 重新入队，稍后重试
-                    logging.warning(f"[{self.consumer_name}] 第{retry_count + 1}次重试...")
+                    logger.warning("[%s] 准备第%s次重试", self.consumer_name, retry_count + 1)
                     ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
                 else:
-                    # 超过最大重试次数，拒绝且不重新入队 → 进入死信队列
-                    logging.error(f"[{self.consumer_name}] 超过最大重试次数，转入死信队列")
+                    logger.error("[%s] 超过最大重试次数，转入死信队列", self.consumer_name)
                     ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
         return wrapper
@@ -224,70 +355,21 @@ class Consumer:
 
 # ===== 实际创建对象并运行 =====
 if __name__ == '__main__':
-    amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+    setup_logging()
+    if len(sys.argv) < 3:
+        logger.error("用法: python rmq.py start|start-daemon|stop <camera_id>")
+        sys.exit(1)
 
-    processor = track_processor(camera_id=sys.argv[1])
-#    # --- 启动消费者A（只收 key 为 A 的数据）---
-#    def track_processing(data):
-#        print(f"  >>> 消费者A处理业务逻辑: {data}")
-#        # 模拟偶尔处理失败
-#        if data.get('id') == 3:
-#            raise Exception("模拟处理失败")
-#        time.sleep(1)
+    command = sys.argv[1]
+    camera_id = sys.argv[2]
+    logger.info("执行命令 command=%s camera_id=%s", command, camera_id)
 
-    camera_id = sys.argv[1]
-    consumer = Consumer(
-        amqp_url = amqp_url,
-        queue_name = camera_id,
-        routing_key_pattern = camera_id,
-        consumer_name = f'consumer_{camera_id}',
-        message_ttl_ms=86400000,   # 24小时
-        max_queue_length=10000,
-        max_retries=3
-    )
-    # thread_a = threading.Thread(target=consumer.consume, args=(track_processing,), daemon=True)
-
-    thread_a = threading.Thread(target=consumer.consume, args=(processor.process_message,), daemon=True)
-    thread_a.start()
-
-#
-#    # --- 启动消费者B（只收 key 为 B 的数据）---
-#    def callback_b(data):
-#        print(f"  >>> 消费者B处理业务逻辑: {data}")
-#        time.sleep(1)
-#
-#    consumer_b = Consumer(
-#        amqp_url=amqp_url,
-#        queue_name='queue_B',
-#        routing_key_pattern='B',
-#        consumer_name='消费者B',
-#        message_ttl_ms=86400000,
-#        max_queue_length=10000,
-#        max_retries=3
-#    )
-#    thread_b = threading.Thread(target=consumer_b.consume, args=(callback_b,), daemon=True)
-#    thread_b.start()
-
- #   # --- 启动生产者，发送测试数据 ---
- #   producer = Producer(amqp_url)
- #   time.sleep(1)
-
- #   test_data = [
- #       ('A', {'id': 1, 'value': '这是A的数据'}),
- #       ('B', {'id': 2, 'value': '这是B的数据'}),
- #       ('A', {'id': 3, 'value': '这条会失败并进入死信队列'}),
- #       ('B', {'id': 4, 'value': '这是B的数据'}),
- #   ]
-
- #   for key, data in test_data:
- #       producer.publish(key, data, ttl_ms=86400000)  # 每条消息24小时TTL
- #       time.sleep(0.5)
-
- #   producer.close()
-
-    # 保持主线程运行
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n程序退出")
+    if command == 'start':
+        start_process(camera_id)
+    elif command == 'start-daemon':
+        start_daemon_process(camera_id)
+    elif command == 'stop':
+        stop_process(camera_id)
+    else:
+        logger.error("无效命令: %s，请使用 start / start-daemon / stop", command)
+        sys.exit(1)
