@@ -270,7 +270,7 @@ class track_processor:
         self.current_tracks = {}  # Dictionary to hold track_id -> Track object mapping
         
         #ByteTrack默认30, 其实30次检测。如果每3帧取1帧的话， frame_diff应该是30*3
-        self.frame_diff_threshold = 90  # Frame difference threshold
+        self.frame_diff_threshold = 30  # Frame difference threshold
         
     
     def process_message(self, rmq_data):

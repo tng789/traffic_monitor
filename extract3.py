@@ -39,7 +39,7 @@ def load_models():
     global yolo_model, easyocr_reader
     
     print("正在装入检测模型...")
-    yolo_model = YOLO('./models/best.pt')
+    yolo_model = YOLO('./models/best_v8s.pt')
     
     print("正在装入OCR模型...")
     easyocr_reader = easyocr.Reader(['en'], gpu=True,
@@ -107,6 +107,7 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
     std_timestamp = datetime.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
     last_frame_timestamp_obj = std_timestamp
 
+    lines = []
     try:
         while True:
             # Check if stop event was triggered
@@ -120,8 +121,8 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                 break
             
             frame_num += 1
-            if frame_num % pace != 0:             # 每隔pace帧处理一次,这个地方要详细考虑一下，当前测试视频并未到每秒25帧。
-                continue
+            # if frame_num % pace != 0:             # 每隔pace帧处理一次,这个地方要详细考虑一下，当前测试视频并未到每秒25帧。
+                # continue
             
             timestamp = recognize_timestamp_easyocr(frame, easyocr_reader, timestamp_area_left, timestamp_area_bottom)
             # print(f"帧 {frame_num} 识别到的时间戳: {timestamp}")
@@ -194,7 +195,10 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                             if (producer and 
                                 hasattr(producer, 'channel') and 
                                 producer.channel and 
-                                not getattr(producer.channel, 'is_closed', False)):
+                                not getattr(producer.channel, 'is_closed', False) and
+                                hasattr(producer, 'connection') and
+                                producer.connection and
+                                not getattr(producer.connection, 'is_closed', False)):
                                 producer.publish(camera, json.dumps(detection_data), ttl_ms=86400000) 
                             else:
                                 print(f"RabbitMQ连接不可用，跳过发送数据 for camera {camera}")
@@ -205,10 +209,16 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                             error_str = str(e).lower()
                             if 'connection' in error_str or 'channel' in error_str or 'stream' in error_str:
                                 print(f"检测到RabbitMQ连接问题，跳过发送数据并继续处理视频 for camera {camera}")
-                                
-                        # line = json.dumps(detection_data)
+                                # 根据规范，当检测到关键外部服务（如RabbitMQ）连接断开或通道关闭等不可用状态时，
+                                # 不应继续尝试向其发送数据，应立即将此类错误识别为不可恢复错误，
+                                # 并触发相关业务流程的停止事件
+                                if stop_event and not stop_event.is_set():
+                                    print(f"触发停止事件以优雅退出视频处理 for camera {camera}")
+                                    stop_event.set()
+                                    break
+                        line = json.dumps(detection_data)
                         # print(line)
-                        # lines.append(line)
+                        lines.append(line)
 
                 # 可选：在控制台打印进度
             if frame_num % 30 == 0: # 每30帧打印一次
@@ -226,8 +236,8 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
             # Remove the entry from active_processes to allow restart
             del active_processes[camera]
     # 把lines保存到文件 
-    # with open(f'time_redlight_{camera}.txt', 'w') as f:
-        # f.writelines(lines)
+    with open(f'time_redlight_{camera}.txt', 'w') as f:
+        f.writelines(lines)
 
 
 # Create FastAPI app instance with lifespan
@@ -245,13 +255,13 @@ async def root():
 
 @app.get("/control")
 async def control_camera(camera: str = Query(..., description="Camera identifier string"), 
-                         command: str = Query(..., pattern="^(start|stop)$", description="Command: 'start' or 'stop'")):
+                         command: str = Query(..., pattern="^(start|stop|list)$", description="Command: 'start', 'stop' or 'list'")):
     """
     Control endpoint to handle camera commands.
     
     Args:
         camera (str): Camera identifier string
-        command (str): Command - either 'start' or 'stop'
+        command (str): Command - either 'start', 'stop' or 'list'
     
     Returns:
         dict: Response with the action taken
@@ -329,8 +339,24 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
             "status": "processing_stopped", 
             "message": f"Stop signal sent for camera {camera}"
         }
+    elif command == "list":
+        print("Listing active processes")
+        
+        # Get list of currently running cameras
+        running_cameras = []
+        for cam, proc_info in active_processes.items():
+            if proc_info['running']:
+                running_cameras.append(cam)
+        
+        return {
+            "command": command,
+            "status": "success",
+            "running_processes": len(running_cameras),
+            "cameras": running_cameras,
+            "message": f"Currently running {len(running_cameras)} video processing processes"
+        }
     else:
-        return {"error": "Invalid command. Use 'start' or 'stop'"}
+        return {"error": "Invalid command. Use 'start', 'stop' or 'list'"}
 
 
 # --- Main program for backward compatibility ---
