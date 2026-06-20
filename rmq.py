@@ -50,7 +50,8 @@ def start_process(camera_id):
         return False
     
     # 启动新的消费者进程
-    amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+    # amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+    amqp_url = 'amqp://admin:admin123@192.168.31.82:5672/'
 
     processor = track_processor(camera_id=camera_id)
 
