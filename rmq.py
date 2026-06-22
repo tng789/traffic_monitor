@@ -50,8 +50,8 @@ def start_process(camera_id):
         return False
     
     # 启动新的消费者进程
-    # amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
-    amqp_url = 'amqp://admin:admin123@192.168.31.82:5672/'
+    amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+    # amqp_url = 'amqp://admin:admin123@192.168.31.82:5672/'
 
     processor = track_processor(camera_id=camera_id)
 
@@ -128,6 +128,42 @@ def stop_process(camera_id):
         return True
     else:
         logger.warning("未找到 camera_id=%s 对应的消费者进程", camera_id)
+        return False
+
+
+def clear_queue_for_camera(camera_id):
+    """
+    清理指定camera_id的队列中的数据
+    """
+    amqp_url = 'amqp://admin:zhxk12345@192.168.1.142:5672/'
+    
+    try:
+        # 创建临时连接来清空队列
+        params = pika.URLParameters(amqp_url)
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        
+        # 声明队列（如果不存在则创建，如果存在则获取信息）
+        queue_name = camera_id
+        channel.queue_declare(queue=queue_name, durable=True)
+        
+        # 获取队列消息数量
+        method = channel.queue_declare(queue=queue_name, passive=True)
+        message_count = method.method.message_count
+        
+        if message_count > 0:
+            logger.info("发现 %s 条消息在队列 %s 中，开始清空...", message_count, queue_name)
+            
+            # 一次性清空队列中的所有消息
+            purged_count = channel.queue_purge(queue=queue_name)
+            logger.info("已清空 %s 条消息从队列 %s", purged_count, queue_name)
+        else:
+            logger.info("队列 %s 中没有消息需要清空", queue_name)
+        
+        connection.close()
+        return True
+    except Exception as e:
+        logger.error("清空队列 %s 时发生错误: %s", camera_id, e)
         return False
 
 

@@ -7,18 +7,8 @@ from app_log import get_logger
 
 logger = get_logger(__name__)
 
-# Import WebSocket related components to send messages
-try:
-    from utils import websocket_connections, process_logs
-    import asyncio
-    from web_server import send_log_to_websocket
-except ImportError:
-    # If imports fail, define dummy functions to avoid errors
-    websocket_connections = {}
-    process_logs = {}
-    
-    async def send_log_to_websocket(websocket, log_entry):
-        pass
+# Import the log_message function to send logs to the web UI
+from utils import log_message
 
 
 def parse_message_timestamp(ts_str):
@@ -108,7 +98,7 @@ class Track:
                 })
         
         # Read configuration file for this camera
-        config_file = f'{camera_id}.json'
+        config_file = f'cameras/{camera_id}.json'
         try:
             with open(config_file) as f:
                 config = json.load(f)
@@ -297,18 +287,9 @@ class Track:
                 violation_msg = f"违规检测: track_id={self.track_id}, time={first_data['timestamp']}, violation={violation_desc}"
                 logger.info("camera=%s %s", camera_id, violation_msg)
 
-                try:
-                    import asyncio
-                    if camera_id in websocket_connections:
-                        for connection in websocket_connections[camera_id]:
-                            asyncio.create_task(send_log_to_websocket(connection, {
-                                'timestamp': first_data['timestamp'],
-                                'message': violation_msg
-                            }))
-                except Exception as e:
-                    logger.warning(
-                        "发送违规信息到 WebSocket 失败 camera=%s: %s", camera_id, e, exc_info=True
-                    )
+                # Use the log_message function to ensure logs appear in the web UI
+                import logging
+                log_message(camera_id, violation_msg, level=logging.INFO)
 
                 insert_sql = f'''
                     INSERT INTO {table_name} (
@@ -486,4 +467,3 @@ class track_processor:
         for track_id_to_remove in tracks_to_remove:
             del self.current_tracks[track_id_to_remove]
             logger.debug("已处理并移除 track_id=%s", track_id_to_remove)
-    

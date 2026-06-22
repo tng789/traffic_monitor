@@ -12,6 +12,7 @@ from app_log import get_logger
 
 from fixed_fifo import FixedFIFO
 from rmq import Producer
+from track_processing import track_processor
 
 logger = get_logger(__name__)
 
@@ -120,6 +121,10 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
 
     logger.info("camera=%s 开始主循环处理", camera)
     log_message(camera, f"开始处理视频 for camera {camera}")
+    
+    # Create a track_processor instance to handle detection data directly
+    processor = track_processor(camera_id=camera)
+    
     frame_num = 0
     interval = 1000 // fps * pace
     std_timestamp = datetime.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
@@ -197,6 +202,14 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                             'camera': camera
                         }
 
+                        # Process the detection data directly with the track_processor
+                        # This will handle violations and send logs to the web UI
+                        try:
+                            processor.process_message(detection_data)
+                        except Exception as e:
+                            logger.exception("camera=%s frame=%s 处理检测数据失败", camera, frame_num)
+                            log_message(camera, f"处理检测数据失败: {e}", level=logging.ERROR)
+
                         global producer
                         try:
                             if (producer and
@@ -206,7 +219,7 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                                 hasattr(producer, 'connection') and
                                 producer.connection and
                                 not getattr(producer.connection, 'is_closed', False)):
-                                producer.publish(camera, json.dumps(detection_data), ttl_ms=86400000)
+                                producer.publish(camera, detection_data, ttl_ms=86400000)
                             else:
                                 msg = "RabbitMQ 连接不可用，跳过发送数据"
                                 logger.warning("camera=%s frame=%s %s", camera, frame_num, msg)
@@ -222,8 +235,6 @@ def track_video(camera, stop_event=None, device='cuda', pace = 3):
                                 if stop_event and not stop_event.is_set():
                                     stop_event.set()
                                     break
-                        line = json.dumps(detection_data)
-                        lines.append(line)
 
             if frame_num % 30 == 0:
                 progress_msg = f"已处理帧: {frame_num} / {total_frames}"

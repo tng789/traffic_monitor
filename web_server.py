@@ -8,15 +8,56 @@ import threading
 import uvicorn
 import video_processor
 from video_processor import track_video, load_models
-from utils import log_message, send_log_to_websocket, active_processes, process_logs, websocket_connections
-from rmq import Producer
+from utils import log_message, send_log_to_websocket, active_processes, process_logs, websocket_connections, set_log_producer, set_main_event_loop
+from rmq import Producer, Consumer, start_process, stop_process, cleanup_queue_messages
 from app_log import setup_logging, get_logger
+import logging
+import os
 
 logger = get_logger(__name__)
 app = FastAPI(
     title="Video Processing API", 
     description="API for video processing with YOLO and EasyOCR"
 )
+
+
+def load_camera_configs():
+    """Load camera configurations from the cameras directory"""
+    cameras_dir = "cameras"
+    camera_configs = {}
+    
+    if not os.path.exists(cameras_dir):
+        logger.warning(f"Cameras directory '{cameras_dir}' does not exist")
+        return camera_configs
+    
+    for filename in os.listdir(cameras_dir):
+        if filename.endswith(".json"):
+            filepath = os.path.join(cameras_dir, filename)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    # Use the filename (without extension) as the camera ID
+                    camera_id = os.path.splitext(filename)[0]
+                    camera_configs[camera_id] = config
+                    logger.info(f"Loaded camera config for {camera_id} from {filename}")
+            except Exception as e:
+                logger.error(f"Error loading camera config from {filename}: {e}")
+    
+    return camera_configs
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Set the main event loop for use in other threads
+    set_main_event_loop(asyncio.get_running_loop())
+    
+    # Initialize the log producer in utils
+    try:
+        log_producer = Producer(amqp_url='amqp://admin:zhxk12345@192.168.1.142:5672/')
+        set_log_producer(log_producer)
+        logger.info("Log producer initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize log producer: {e}")
 
 
 @app.get("/")
@@ -59,6 +100,10 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
                 # Remove the old entry to allow restart
                 del active_processes[camera]
         
+        # Start the RabbitMQ consumer for this camera in a separate thread
+        consumer_thread = threading.Thread(target=start_process, args=(camera,), daemon=True)
+        consumer_thread.start()
+        
         # Create a stop event for this camera
         stop_event = threading.Event()
         
@@ -68,11 +113,13 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
             args=(camera, stop_event)
         )
         
-        # Store the thread and stop event
+        # Store the thread and stop event for both video processing and RabbitMQ consumer
         active_processes[camera] = {
             'thread': video_thread,
             'stop_event': stop_event,
-            'running': True
+            'consumer_thread': consumer_thread,
+            'running': True,
+            'consumer_started': True
         }
         
         # Start the video processing thread
@@ -82,7 +129,7 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
             "camera": camera,
             "command": command,
             "status": "processing_started",
-            "message": f"Started processing for camera {camera}"
+            "message": f"Started processing and RabbitMQ consumer for camera {camera}"
         }
     elif command == "stop":
         logger.info("收到停止命令 camera=%s", camera)
@@ -96,11 +143,27 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
                 "message": f"Camera {camera} is not currently being processed"
             }
         
-        # Set the stop event to signal the thread to stop
+        # Step 1: Stop the video processing thread first
         active_processes[camera]['stop_event'].set()
+        logger.info("已发送停止信号给视频处理线程 camera=%s", camera)
         
-        # Optionally wait for the thread to finish (with timeout)
-        # active_processes[camera]['thread'].join(timeout=5)  # Wait up to 5 seconds
+        # Wait briefly for the video processing thread to finish
+        if 'thread' in active_processes[camera]:
+            active_processes[camera]['thread'].join(timeout=2)
+        
+        # Step 2: Clean up RabbitMQ queue messages for this camera
+        try:
+            cleanup_queue_messages(camera)
+            logger.info("已清理 camera=%s 在 RabbitMQ 中的相关数据", camera)
+        except Exception as e:
+            logger.error("清理 camera=%s 的 RabbitMQ 数据失败: %s", camera, e)
+        
+        # Step 3: Stop the RabbitMQ consumer process
+        try:
+            stop_process(camera)
+            logger.info("已停止 camera=%s 的RabbitMQ消费者", camera)
+        except Exception as e:
+            logger.error("停止 camera=%s 的RabbitMQ消费者失败: %s", camera, e)
         
         # Mark as not running anymore
         active_processes[camera]['running'] = False
@@ -109,7 +172,7 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
             "camera": camera,
             "command": command,
             "status": "processing_stopped", 
-            "message": f"Stop signal sent for camera {camera}"
+            "message": f"Stop signal sent for camera {camera} (video processing and RabbitMQ consumer)"
         }
     elif command == "list":
         logger.info("收到 list 命令，查询运行中的相机")
@@ -129,6 +192,19 @@ async def control_camera(camera: str = Query(..., description="Camera identifier
         }
     else:
         return {"error": "Invalid command. Use 'start', 'stop' or 'list'"}
+
+
+@app.get("/cameras")
+async def get_cameras():
+    """Return the list of available cameras from the config files"""
+    camera_configs = load_camera_configs()
+    cameras_list = []
+    for camera_id, config in camera_configs.items():
+        cameras_list.append({
+            "id": camera_id,
+            "config": config
+        })
+    return {"cameras": cameras_list}
 
 
 @app.get("/monitor")
@@ -203,6 +279,12 @@ async def monitor_page():
             font-size: 14px;
             color: #666;
         }
+        .process-config {
+            margin-top: 5px;
+            font-size: 12px;
+            color: #888;
+            word-break: break-all;
+        }
         .process-controls {
             display: flex;
             gap: 10px;
@@ -274,40 +356,61 @@ async def monitor_page():
     <script>
         let selectedCamera = null;
         let currentWebSocket = null;
+        let cameraConfigs = {};
+
+        // 获取摄像机配置
+        async function loadCameraConfigs() {
+            const response = await fetch('/cameras');
+            const data = await response.json();
+            
+            // Store camera configs for later use
+            data.cameras.forEach(camera => {
+                cameraConfigs[camera.id] = camera.config;
+            });
+            
+            return data.cameras;
+        }
 
         // 获取并显示进程列表
         async function loadProcessList() {
             const response = await fetch('/control?camera=dummy&command=list');
-            const data = await response.json();
+            const processData = await response.json();
+            
+            // Get all cameras from config files
+            const allCameras = await loadCameraConfigs();
             
             const processListElement = document.getElementById('processList');
             processListElement.innerHTML = '';
             
-            // Display all cameras (whether running or not)
-            for (const [cameraId, processInfo] of Object.entries(window.activeProcesses || {})) {
-                addProcessItem(processListElement, cameraId, processInfo.running);
-            }
-            
-            // If no processes exist yet, show a message
-            if (Object.keys(window.activeProcesses || {}).length === 0) {
-                processListElement.innerHTML = '<p>暂无视频处理程序</p>';
+            // Display all configured cameras
+            if (allCameras.length === 0) {
+                processListElement.innerHTML = '<p>未找到任何摄像机配置文件</p>';
+            } else {
+                allCameras.forEach(camera => {
+                    const isRunning = processData.cameras.includes(camera.id);
+                    addProcessItem(processListElement, camera.id, isRunning, camera.config);
+                });
             }
         }
 
         // 添加进程项到列表
-        function addProcessItem(container, cameraId, isRunning) {
+        function addProcessItem(container, cameraId, isRunning, config) {
             const item = document.createElement('div');
             item.className = 'process-item';
             item.dataset.camera = cameraId;
+            
+            // Limit config display to first 100 chars
+            const configPreview = JSON.stringify(config).substring(0, 100) + (JSON.stringify(config).length > 100 ? '...' : '');
             
             item.innerHTML = `
                 <div class="process-info">
                     <div class="process-name">${cameraId}</div>
                     <div class="process-status">状态: ${isRunning ? '运行中' : '已停止'}</div>
+                    <div class="process-config">配置: ${configPreview}</div>
                 </div>
                 <div class="process-controls">
                     <button class="btn btn-start" onclick="controlCamera('${cameraId}', 'start')">启动</button>
-                    <button class="btn btn-stop" onclick="controlCamera('${cameraId}', 'stop')">停止</button>
+                    <button class="btn btn-stop" onclick="controlCamera('${cameraId}', 'stop')" ${!isRunning ? 'disabled' : ''}>停止</button>
                 </div>
             `;
             
@@ -369,8 +472,12 @@ async def monitor_page():
             };
             
             currentWebSocket.onmessage = function(event) {
-                const logEntry = JSON.parse(event.data);
-                displayLogEntry(logEntry);
+                try {
+                    const logEntry = JSON.parse(event.data);
+                    displayLogEntry(logEntry);
+                } catch (e) {
+                    console.error('Error parsing WebSocket message:', e);
+                }
             };
             
             currentWebSocket.onerror = function(error) {
@@ -444,11 +551,16 @@ def start_server(host="0.0.0.0", port=8000, auto_start_cameras: List[str] = None
         port: Port number to bind the server
         auto_start_cameras: List of camera IDs to automatically start when server starts
     """
-    video_processor.producer = Producer(amqp_url='amqp://admin:zhxk12345@192.168.1.142:5672/')
+    # Create the main RabbitMQ producer
+    main_producer = Producer(amqp_url='amqp://admin:zhxk12345@192.168.1.142:5672/')
+    video_processor.producer = main_producer
 
     if video_processor.producer is None:
         logger.error("无法创建 RabbitMQ Producer 实例")
         return
+
+    # Set the log producer in utils
+    set_log_producer(main_producer)
 
     logger.info("正在启动服务并装载模型...")
     load_models()
@@ -470,6 +582,10 @@ def start_server(host="0.0.0.0", port=8000, auto_start_cameras: List[str] = None
                     # Remove the old entry to allow restart
                     del active_processes[camera]
             
+            # Start the RabbitMQ consumer for this camera
+            consumer_thread = threading.Thread(target=start_process, args=(camera,), daemon=True)
+            consumer_thread.start()
+            
             # Create a stop event for this camera
             stop_event = threading.Event()
             
@@ -483,7 +599,9 @@ def start_server(host="0.0.0.0", port=8000, auto_start_cameras: List[str] = None
             active_processes[camera] = {
                 'thread': video_thread,
                 'stop_event': stop_event,
-                'running': True
+                'consumer_thread': consumer_thread,
+                'running': True,
+                'consumer_started': True
             }
             
             # Start the video processing thread
