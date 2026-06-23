@@ -108,16 +108,34 @@ class Track:
         
         # 2. Check for wrong direction
         if 'wrongdirection' in config:
-            wrong_direction_config = config['wrongdirection']
-            direction = wrong_direction_config['direction']
-            area_coords = wrong_direction_config['area']
-            
-            if self.check_wrong_direction(track_data_list, area_coords, direction):
-                violation_records.append({
-                    'type': 4,  # 逆行
-                    'first_data': track_data_list[0]
-                })
-        
+            wrong_direction_list = config['wrongdirection'] # 现在这是一个列表
+                    
+            # 遍历每一个逆行区域
+            for area_config in wrong_direction_list:
+                direction = area_config['direction']       # 正常行驶方向
+                area_coords = area_config['area']         # 区域坐标
+                        
+                # 检查轨迹是否在该区域逆行
+                if self.check_wrong_direction(track_data_list, area_coords, direction):
+                    violation_records.append({
+                        'type': 4,  # 逆行
+                        'first_data': track_data_list[0]
+                    })
+                    # 因为区域不重叠，轨迹如果在A区域逆行，肯定不会再在B区域逆行
+                    # 所以一旦发现逆行，直接跳出循环，提高执行效率
+                    break
+
+#        if 'wrongdirection' in config:
+#            wrong_direction_config = config['wrongdirection']
+#            direction = wrong_direction_config['direction']
+#            area_coords = wrong_direction_config['area']
+#            
+#            if self.check_wrong_direction(track_data_list, area_coords, direction):
+#                violation_records.append({
+#                    'type': 4,  # 逆行
+#                    'first_data': track_data_list[0]
+#                })
+#        
         # 3. Check for running red light
         if 'runredlight' in config:
             red_light_area = config['runredlight']
